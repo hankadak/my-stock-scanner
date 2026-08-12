@@ -5,7 +5,7 @@ import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 1. 페이지 설정
-st.set_page_config(page_title="고승률 정밀 급등 스캐너", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="이가네황가네 부자되기", page_icon="🎯", layout="wide")
 
 # -------------------------------------------------------------------
 # 🔥 [화면 꺼짐 방지] 스마트폰 화면 자동 잠금/꺼짐 방지 스크립트
@@ -34,10 +34,10 @@ st.components.v1.html(
     height=0,
 )
 
-st.title("🎯 승률 극대화 정밀 급등 스캐너")
-st.caption("모바일 화면 잠금 방지 적용 | 볼린저 밴드 + RSI 정밀 알고리즘")
+st.title("🎯 TOP 10 고승률 엄선 급등 스캐너")
+st.caption("전체 스캔 결과 중 수급과 기술적 점수가 가장 뛰어난 상위 10개 종목만 엄선하여 보여줍니다.")
 
-# 사이드바 설정 (스캔 범위 선택 - 상위 1,000개 제거)
+# 사이드바 설정 (스캔 범위 선택)
 st.sidebar.header("⚙️ 스캔 범위 설정")
 market_choice = st.sidebar.radio(
     "스캔할 시장을 선택하세요:",
@@ -67,7 +67,7 @@ def load_selected_stocks(choice):
 TARGET_STOCKS = load_selected_stocks(market_choice)
 st.sidebar.metric("현재 분석 대상 종목 수", f"{len(TARGET_STOCKS):,} 개")
 
-# 개별 종목 분석 함수
+# 개별 종목 분석 및 점수 산정 함수
 def analyze_single_stock(name, code, start_date):
     try:
         df = fdr.DataReader(code, start_date)
@@ -105,9 +105,11 @@ def analyze_single_stock(name, code, start_date):
         body = abs(c - o)
         upper_shadow = h - max(o, c)
         
-        # 익절/손절가 자동 제시
         target_price = int(c * 1.05)
         stop_price = int(c * 0.97)
+        
+        # 통합 종합 점수 산출 (거래량 증가율 + 등락률 + RSI 적정성)
+        score = vol_ratio * 0.4 + change * 10 + (68 - abs(60 - curr_rsi)) * 2
         
         # 1. 🔥 [고승률 종가베팅]
         is_high_win_cb = (
@@ -123,7 +125,8 @@ def analyze_single_stock(name, code, start_date):
                 '종목명': name, '종목코드': code, '마감일': latest_date,
                 '포착 조건': "🔥 볼린저상단 돌파 + 수급 분출",
                 '종가': f"{int(c):,}원", '등락률': f"{change:+.2f}%",
-                'RSI': f"{curr_rsi:.1f}", '목표가(+5%)': f"{target_price:,}원", '손절가(-3%)': f"{stop_price:,}원"
+                'RSI': f"{curr_rsi:.1f}", '목표가(+5%)': f"{target_price:,}원", '손절가(-3%)': f"{stop_price:,}원",
+                '_score': score
             })
 
         # 2. ⚡ [단타 / 돌파]
@@ -133,7 +136,8 @@ def analyze_single_stock(name, code, start_date):
                 '종목명': name, '종목코드': code, '마감일': latest_date,
                 '포착 조건': "⚡ 전일 고점 돌파 + 거래량 유입",
                 '종가': f"{int(c):,}원", '등락률': f"{change:+.2f}%",
-                'RSI': f"{curr_rsi:.1f}", '목표가(+5%)': f"{target_price:,}원", '손절가(-3%)': f"{stop_price:,}원"
+                'RSI': f"{curr_rsi:.1f}", '목표가(+5%)': f"{target_price:,}원", '손절가(-3%)': f"{stop_price:,}원",
+                '_score': score
             })
 
         # 3. 📈 [스윙]
@@ -143,14 +147,15 @@ def analyze_single_stock(name, code, start_date):
                 '종목명': name, '종목코드': code, '마감일': latest_date,
                 '포착 조건': "📈 20일 이동평균선 돌파/반등",
                 '종가': f"{int(c):,}원", '등락률': f"{change:+.2f}%",
-                'RSI': f"{curr_rsi:.1f}", '목표가(+7%)': f"{int(c*1.07):,}원", '손절가(-3%)': f"{stop_price:,}원"
+                'RSI': f"{curr_rsi:.1f}", '목표가(+7%)': f"{int(c*1.07):,}원", '손절가(-3%)': f"{stop_price:,}원",
+                '_score': score
             })
             
     except Exception:
         return None
     return None
 
-# 병렬 처리 스캔 함수
+# 병렬 스캔 실행 함수
 def run_scanner():
     cb_list, day_list, swing_list = [], [], []
     today = datetime.datetime.now()
@@ -169,38 +174,46 @@ def run_scanner():
                 if category == 'closing_bet': cb_list.append(data)
                 elif category == 'day_trade': day_list.append(data)
                 elif category == 'swing': swing_list.append(data)
-                    
-    return pd.DataFrame(cb_list), pd.DataFrame(day_list), pd.DataFrame(swing_list)
+                
+    # 점수 높은 순으로 정렬 후 상위 10개만 슬라이싱
+    def filter_top10(data_list):
+        if not data_list:
+            return pd.DataFrame()
+        df = pd.DataFrame(data_list)
+        df = df.sort_values(by='_score', ascending=False).head(10)
+        return df.drop(columns=['_score'])
+        
+    return filter_top10(cb_list), filter_top10(day_list), filter_top10(swing_list)
 
-# 스캔 버튼
-if st.button("🚀 정밀 고승률 스캔 시작", type="primary"):
+# 스캔 실행 버튼
+if st.button("🚀 TOP 10 고승률 엄선 스캔 시작", type="primary"):
     if not TARGET_STOCKS:
         st.error("종목 목록을 불러오지 못했습니다.")
     else:
-        with st.spinner("모바일 화면 유지 중... 차트 & 지표 초고속 분석 중"):
+        with st.spinner("수급 및 기술적 점수 계산 중... TOP 10 종목을 엄선합니다."):
             df_cb, df_day, df_swing = run_scanner()
             
-            st.subheader("🔥 [종가베팅] 볼린저밴드 상단 돌파 + 정밀 수급 종목")
+            st.subheader("🔥 [종가베팅 TOP 10] 볼린저상단 돌파 + 수급 최고 종목")
             if not df_cb.empty:
-                st.success(f"종가베팅 포착: {len(df_cb)}개")
+                st.success(f"가장 우수한 종가베팅 종목 {len(df_cb)}개 선정 완료!")
                 st.dataframe(df_cb, use_container_width=True)
             else:
-                st.info("엄격한 조건(BB 상단 돌파 + RSI 최적)을 만족하는 종가베팅 종목이 없습니다.")
+                st.info("조건을 만족하는 종가베팅 종목이 없습니다.")
                 
             st.divider()
             
-            st.subheader("⚡ [단타] 전일 고점 돌파 & 모멘텀 유입")
+            st.subheader("⚡ [단타 TOP 10] 전일 고점 돌파 & 모멘텀 최고 종목")
             if not df_day.empty:
-                st.success(f"단타 포착: {len(df_day)}개")
+                st.success(f"가장 우수한 단타 종목 {len(df_day)}개 선정 완료!")
                 st.dataframe(df_day, use_container_width=True)
             else:
-                st.info("단타 포착 종목이 없습니다.")
+                st.info("조건을 만족하는 단타 종목이 없습니다.")
                 
             st.divider()
             
-            st.subheader("📈 [스윙] 20일선 돌파 / 바닥 반등 종목")
+            st.subheader("📈 [스윙 TOP 10] 20일선 돌파 / 추세 전환 최고 종목")
             if not df_swing.empty:
-                st.success(f"스윙 포착: {len(df_swing)}개")
+                st.success(f"가장 우수한 스윙 종목 {len(df_swing)}개 선정 완료!")
                 st.dataframe(df_swing, use_container_width=True)
             else:
-                st.info("스윙 포착 종목이 없습니다.")
+                st.info("조건을 만족하는 스윙 종목이 없습니다.")
