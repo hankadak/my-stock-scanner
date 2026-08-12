@@ -5,7 +5,7 @@ import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 1. 페이지 설정
-st.set_page_config(page_title="이가네황가네 부자되기", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="이가네황가네 부자되기 프로젝트", page_icon="🎯", layout="wide")
 
 # -------------------------------------------------------------------
 # 🔥 [화면 꺼짐 방지] 스마트폰 화면 자동 잠금/꺼짐 방지 스크립트
@@ -34,7 +34,7 @@ st.components.v1.html(
     height=0,
 )
 
-st.title("🎯 TOP 10 고승률 엄선 급등 스캐너")
+st.title("🎯 이가네황가네 부자되기 프로젝트")
 st.caption("전체 스캔 결과 중 수급과 기술적 점수가 가장 뛰어난 상위 10개 종목만 엄선하여 보여줍니다.")
 
 # 사이드바 설정 (스캔 범위 선택)
