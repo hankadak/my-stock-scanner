@@ -6,7 +6,7 @@ import datetime
 # 1. 페이지 설정
 st.set_page_config(page_title="우리모두 때돈벌자", page_icon="⚡", layout="wide")
 
-st.title("⚡ 600개 주요 종목 맞춤형 급등 스캐너")
+st.title("⚡ 우리모두 때돈벌자")
 st.caption("장 마감 후/주말 대응 | 코스피/코스닥 핵심 600여 개 종목 대상 (빠른 스캔 속도)")
 
 # 2. 거래량 및 시가총액 상위 600개 종목 자동 선별 (캐싱)
