@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import FinanceDataReader as fdr
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup  # 👈 'from bs4 import BeautifulSoup' 형태여야 합니다!
+from bs4 import BeautifulSoup
 import streamlit as st
 
 # 1. 페이지 설정
@@ -83,33 +83,37 @@ def get_stock_extra_info(code):
     res_data = {"overtime": 0.0, "is_high_risk": False}
     try:
         url = f"https://finance.naver.com/item/main.naver?code={code}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        res = requests.get(url, headers=headers, timeout=2)
-        soup = BeautifulSoup(res.text, "html.parser")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        res = requests.get(url, headers=headers, timeout=3)
 
-        # 🚨 [위험 필터 1] 증100 또는 신용불가 딱지 체크
-        first_html = res.text[:10000]  # 상단 영역 검사
-        if "증100" in first_html or "신용불가" in first_html:
-            res_data["is_high_risk"] = True
-            return res_data
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.text, "html.parser")
 
-        # 📈 시간외 단일가 추출
-        overtime_section = soup.select_one(".section.overtime")
-        if overtime_section:
-            em_tag = overtime_section.select_one("em")
-            if em_tag:
-                text = (
-                    em_tag.get_text()
-                    .strip()
-                    .replace("%", "")
-                    .replace(",", "")
-                )
-                val = float(text)
-                if "nv01" in em_tag.get("class", []) or "down" in em_tag.get(
-                    "class", []
-                ):
-                    val = -abs(val)
-                res_data["overtime"] = val
+            # 🚨 [위험 필터 1] 증100 또는 신용불가 딱지 체크
+            first_html = res.text[:10000]
+            if "증100" in first_html or "신용불가" in first_html:
+                res_data["is_high_risk"] = True
+                return res_data
+
+            # 📈 시간외 단일가 추출
+            overtime_section = soup.select_one(".section.overtime")
+            if overtime_section:
+                em_tag = overtime_section.select_one("em")
+                if em_tag:
+                    text = (
+                        em_tag.get_text()
+                        .strip()
+                        .replace("%", "")
+                        .replace(",", "")
+                    )
+                    val = float(text)
+                    if "nv01" in em_tag.get("class", []) or "down" in em_tag.get(
+                        "class", []
+                    ):
+                        val = -abs(val)
+                    res_data["overtime"] = val
     except Exception:
         pass
     return res_data
@@ -118,9 +122,8 @@ def get_stock_extra_info(code):
 # 4. 개별 종목 분석 및 정밀 스캔 함수
 def analyze_single_stock(name, code, start_date):
     try:
-        # 최소 200일선 계산을 위해 충분한 일봉 데이터 수집 (start_date)
         df = fdr.DataReader(code, start_date)
-        if len(df) < 120:  # 최소 데이터 검증
+        if df is None or len(df) < 60:
             return None
 
         latest = df.iloc[-1]
@@ -142,11 +145,11 @@ def analyze_single_stock(name, code, start_date):
         if h > 0 and ((h - c) / h) * 100 >= 15.0:
             return None
 
-        # 🚨 [위험 필터 3] 일봉 200일선 역배열 차단
+        # 🚨 [위험 필터 3] 일봉 200일선 역배열 차단 (데이터가 충분할 때만)
         if len(df) >= 200:
             ma200 = df["Close"].rolling(200).mean().iloc[-1]
-            if c < ma200:
-                return None  # 머리 위 강한 저항선 존재 시 탈락
+            if pd.notna(ma200) and c < ma200:
+                return None
 
         change = ((c - prev["Close"]) / prev["Close"]) * 100
         vol_ratio = (
@@ -155,7 +158,7 @@ def analyze_single_stock(name, code, start_date):
             else 0
         )
 
-        # 지표 계산 (MA20, BB, RSI)
+        # 지표 계산
         df["MA20"] = df["Close"].rolling(20).mean()
         df["STD20"] = df["Close"].rolling(20).std()
         df["UpperBB"] = df["MA20"] + (df["STD20"] * 2)
@@ -163,6 +166,9 @@ def analyze_single_stock(name, code, start_date):
         delta = df["Close"].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+
+        # ZeroDivisionError 방지
+        loss = loss.replace(0, 0.00001)
         rs = gain / loss
         df["RSI"] = 100 - (100 / (1 + rs))
 
@@ -172,7 +178,6 @@ def analyze_single_stock(name, code, start_date):
         body = abs(c - o)
         upper_shadow = h - max(o, c)
 
-        # 캔들 상태
         if upper_shadow <= body * 0.15:
             candle_status = "🔥 장대양봉(최상)"
         else:
@@ -181,7 +186,7 @@ def analyze_single_stock(name, code, start_date):
         target_price = int(c * 1.05)
         stop_price = int(c * 0.97)
 
-        # 전략별 기본 조건
+        # 전략 조건
         is_high_win_cb = (
             (c > curr_upper_bb)
             and (vol_ratio >= 200)
@@ -204,15 +209,14 @@ def analyze_single_stock(name, code, start_date):
             and (45 <= curr_rsi <= 60)
         )
 
-        # 1차 조건 충족 종목만 크롤링 수행
+        # 조건 부합 시 크롤링 검증
         if is_high_win_cb or is_day_trade or is_swing:
             extra_info = get_stock_extra_info(code)
 
-            # 🚨 [위험 필터 4] 증100 또는 신용불가 종목 즉시 탈락
+            # 증100/신용불가 탈락
             if extra_info["is_high_risk"]:
                 return None
 
-            # 시간외 -0.5% 이하 하락 종목 탈락
             overtime_val = extra_info["overtime"]
             if overtime_val < -0.5:
                 return None
@@ -263,10 +267,10 @@ def analyze_single_stock(name, code, start_date):
 def run_scanner():
     cb_list, day_list, swing_list = [], [], []
     today = datetime.datetime.now()
-    # 200일선 계산을 위해 과거 300일 이전 데이터 수집
     start_date = (today - datetime.timedelta(days=300)).strftime("%Y-%m-%d")
 
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    # 안정적인 요청 처리를 위해 max_workers를 8로 조정
+    with ThreadPoolExecutor(max_workers=8) as executor:
         futures = [
             executor.submit(analyze_single_stock, name, code, start_date)
             for name, code in TARGET_STOCKS.items()
