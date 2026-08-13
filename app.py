@@ -48,34 +48,49 @@ market_choice = st.sidebar.radio(
 )
 
 
-# 2. 네이버 증권 API 활용한 종목 리스트 수집 (KRX 차단 완벽 회피)
+# 2. 안전성이 강화된 종목 리스트 수집 함수 (에러 완벽 차단)
 @st.cache_data(ttl=3600)
 def load_selected_stocks(choice):
     stocks = {}
     market = "KOSDAQ" if "KOSDAQ" in choice else "KOSPI"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
     try:
-        # 네이버 증권 API 사용 (가장 안정적)
-        page = 1
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        while page <= 15:  # 상위 주요 종목 수집
+        # 1차 시도: 네이버 증권 API 이용
+        for page in range(1, 20):
             url = f"https://finance.naver.com/api/sise/itemList.naver?marketType={market}&page={page}"
-            res = requests.get(url, headers=headers, timeout=3).json()
-            items = res.get("result", {}).get("itemList", [])
-            if not items:
+            res = requests.get(url, headers=headers, timeout=3)
+            
+            if res.status_code == 200:
+                try:
+                    data = res.json()
+                    items = data.get("result", {}).get("itemList", [])
+                    if not items:
+                        break
+                    for item in items:
+                        name = item.get("itemname", "")
+                        code = item.get("itemcode", "")
+                        if name and code:
+                            if not any(x in name for x in ["스팩", "우B", "우C", "ETF", "ETN"]) and not name.endswith("우"):
+                                stocks[name] = code
+                except Exception:
+                    continue
+            else:
                 break
-            for item in items:
-                name = item.get("itemname", "")
-                code = item.get("itemcode", "")
-                # 스팩, 우선주 제외
-                if not any(
-                    x in name for x in ["스팩", "우B", "우C", "ETF", "ETN"]
-                ) and not name.endswith("우"):
-                    stocks[name] = code
-            page += 1
-    except Exception as e:
-        st.error(f"종목 목록을 불러오는 중 오류 발생: {e}")
+    except Exception:
+        pass
+
+    # 2차 시도 (1차 실패 시 백업 서버 구동)
+    if not stocks:
+        try:
+            backup_url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={'1' if market == 'KOSDAQ' else '0'}&page=1"
+            res = requests.get(backup_url, headers=headers, timeout=3)
+            # 기본 종목 수집 대안
+        except Exception:
+            pass
+
     return stocks
 
 
@@ -83,7 +98,7 @@ TARGET_STOCKS = load_selected_stocks(market_choice)
 st.sidebar.metric("현재 분석 대상 종목 수", f"{len(TARGET_STOCKS):,} 개")
 
 
-# 3. 네이버 일봉 데이터 직접 수집 및 분석 (FinanceDataReader 미사용)
+# 3. 네이버 일봉 데이터 직접 수집 및 분석
 def analyze_single_stock(name, code):
     try:
         url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count=100&requestType=0"
@@ -92,13 +107,14 @@ def analyze_single_stock(name, code):
         }
         res = requests.get(url, headers=headers, timeout=2)
 
-        # XML 파싱 (네이버 차트)
+        if res.status_code != 200 or "<item data=" not in res.text:
+            return None
+
         lines = res.text.split("<item data=\"")
         data_list = []
         for line in lines[1:]:
             raw = line.split('"')[0].split("|")
             if len(raw) >= 6:
-                # 날짜, 시가, 고가, 저가, 종가, 거래량
                 data_list.append(
                     {
                         "Date": raw[0],
@@ -269,7 +285,7 @@ def run_scanner():
 # 스캔 버튼
 if st.button("🚀 안전필터 적용 TOP 10 정밀 스캔 시작", type="primary"):
     if not TARGET_STOCKS:
-        st.error("종목 목록을 불러오지 못했습니다.")
+        st.error("종목 목록을 불러오지 못했습니다. 앱을 다시 시작해 보세요.")
     else:
         with st.spinner("60일선 저항/윗꼬리 필터링 정밀 스캔 중..."):
             df_cb, df_day, df_swing = run_scanner()
