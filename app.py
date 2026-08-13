@@ -3,8 +3,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import FinanceDataReader as fdr
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
 import streamlit as st
 
 # 1. 페이지 설정
@@ -40,15 +38,13 @@ st.components.v1.html(
 )
 
 st.title("💰 이가네황가네 부자되기프로젝트")
-st.caption(
-    "장중 차트 수급 + 캔들 모양 + 증100/신용불가/60일선 저항 예외 필터링 + 시간외 단일가 스캔"
-)
+st.caption("장중 차트 수급 + 캔들 모양 + 윗꼬리/역배열 예외 필터링 분석기")
 
 # 사이드바 설정 (스캔 범위 선택)
 st.sidebar.header("⚙️ 스캔 범위 설정")
 market_choice = st.sidebar.radio(
     "스캔할 시장을 선택하세요:",
-    ["KOSDAQ 전종목 (추천)", "KOSPI 전종목", "KRX 전체 (메모리 주의)"],
+    ["KOSDAQ 전종목 (추천)", "KOSPI 전종목"],
 )
 
 
@@ -77,49 +73,9 @@ TARGET_STOCKS = load_selected_stocks(market_choice)
 st.sidebar.metric("현재 분석 대상 종목 수", f"{len(TARGET_STOCKS):,} 개")
 
 
-# 3. 크롤링 예외 구속 함수
-def get_stock_extra_info_safe(code):
-    res_data = {"overtime": 0.0, "is_high_risk": False}
-    try:
-        url = f"https://finance.naver.com/item/main.naver?code={code}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        res = requests.get(url, headers=headers, timeout=1.5)
-
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
-            first_html = res.text[:8000]
-
-            if "증100" in first_html or "신용불가" in first_html:
-                res_data["is_high_risk"] = True
-                return res_data
-
-            overtime_section = soup.select_one(".section.overtime")
-            if overtime_section:
-                em_tag = overtime_section.select_one("em")
-                if em_tag:
-                    text = (
-                        em_tag.get_text()
-                        .strip()
-                        .replace("%", "")
-                        .replace(",", "")
-                    )
-                    val = float(text)
-                    if "nv01" in em_tag.get("class", []) or "down" in em_tag.get(
-                        "class", []
-                    ):
-                        val = -abs(val)
-                    res_data["overtime"] = val
-    except Exception:
-        pass
-    return res_data
-
-
-# 4. 개별 종목 분석 함수 (메모리 경량화 버전)
+# 3. 개별 종목 분석 함수 (초안정성 버전)
 def analyze_single_stock(name, code, start_date):
     try:
-        # 경량화된 데이터 조회
         df = fdr.DataReader(code, start_date)
         if df is None or len(df) < 60:
             return None
@@ -135,7 +91,7 @@ def analyze_single_stock(name, code, start_date):
             latest["Low"],
         )
 
-        # 동전주 및 거래량 미달 차단
+        # 동전주 및 소형 거래량 차단
         if c < 1000 or latest["Volume"] < 50000:
             return None
 
@@ -143,7 +99,7 @@ def analyze_single_stock(name, code, start_date):
         if h > 0 and ((h - c) / h) * 100 >= 15.0:
             return None
 
-        # 🚨 [위험 필터 2] 일봉 60일 수급선 역배열 차단 (메모리 절약을 위해 60일선 활용)
+        # 🚨 [위험 필터 2] 60일선 이하 역배열 차단
         ma60 = df["Close"].rolling(60).mean().iloc[-1]
         if pd.notna(ma60) and c < ma60:
             return None
@@ -155,7 +111,7 @@ def analyze_single_stock(name, code, start_date):
             else 0
         )
 
-        # 지표 계산
+        # 기술적 지표 계산
         df["MA20"] = df["Close"].rolling(20).mean()
         df["STD20"] = df["Close"].rolling(20).std()
         df["UpperBB"] = df["MA20"] + (df["STD20"] * 2)
@@ -204,29 +160,8 @@ def analyze_single_stock(name, code, start_date):
             and (45 <= curr_rsi <= 60)
         )
 
-        # 조건 충족 종목만 크롤링 검증
         if is_high_win_cb or is_day_trade or is_swing:
-            extra_info = get_stock_extra_info_safe(code)
-
-            if extra_info["is_high_risk"]:
-                return None
-
-            overtime_val = extra_info["overtime"]
-            if overtime_val < -0.5:
-                return None
-
-            ot_str = (
-                f"+{overtime_val:.2f}%"
-                if overtime_val > 0
-                else f"{overtime_val:.2f}%"
-            )
-            score = (
-                vol_ratio * 0.4
-                + change * 10
-                + (68 - abs(60 - curr_rsi)) * 2
-                + overtime_val * 20
-            )
-
+            score = vol_ratio * 0.4 + change * 10 + (68 - abs(60 - curr_rsi)) * 2
             if upper_shadow <= body * 0.15:
                 score += 15
 
@@ -237,7 +172,6 @@ def analyze_single_stock(name, code, start_date):
                 "캔들 상태": candle_status,
                 "종가": f"{int(c):,}원",
                 "등락률": f"{change:+.2f}%",
-                "시간외단일가": ot_str,
                 "RSI": f"{curr_rsi:.1f}",
                 "목표가(+5%)": f"{target_price:,}원",
                 "손절가(-3%)": f"{stop_price:,}원",
@@ -261,11 +195,10 @@ def analyze_single_stock(name, code, start_date):
 def run_scanner():
     cb_list, day_list, swing_list = [], [], []
     today = datetime.datetime.now()
-    # ⚡ [메모리 절약 핵심] 수집 기간을 120일로 대폭 축소하여 메모리 다운 방지
     start_date = (today - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
 
-    # 쓰레드 4개로 제한하여 안정성 극대화
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    # 안정적인 2스레드 처리
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [
             executor.submit(analyze_single_stock, name, code, start_date)
             for name, code in TARGET_STOCKS.items()
@@ -304,38 +237,30 @@ if st.button("🚀 안전필터 적용 TOP 10 정밀 스캔 시작", type="prima
     if not TARGET_STOCKS:
         st.error("종목 목록을 불러오지 못했습니다.")
     else:
-        with st.spinner(
-            "증100/신용불가/60일선 필터링 + 시간외 단일가 검증 중..."
-        ):
+        with st.spinner("60일선 저항/윗꼬리 필터링 정밀 스캔 중..."):
             df_cb, df_day, df_swing = run_scanner()
 
-            st.subheader(
-                "🔥 [종가베팅 TOP 10] 볼린저상단 돌파 + 안전성 검증 종목"
-            )
+            st.subheader("🔥 [종가베팅 TOP 10] 볼린저상단 돌파 종목")
             if not df_cb.empty:
                 st.success(f"조건 부합 종가베팅 {len(df_cb)}개 선정!")
                 st.dataframe(df_cb, use_container_width=True)
             else:
-                st.info("조건을 완벽히 부합하는 안전한 종가베팅 종목이 없습니다.")
+                st.info("조건을 완벽히 부합하는 종가베팅 종목이 없습니다.")
 
             st.divider()
 
-            st.subheader(
-                "⚡ [단타 TOP 10] 전일 고점 돌파 & 안전성 검증 종목"
-            )
+            st.subheader("⚡ [단타 TOP 10] 전일 고점 돌파 종목")
             if not df_day.empty:
                 st.success(f"조건 부합 단타 {len(df_day)}개 선정!")
                 st.dataframe(df_day, use_container_width=True)
             else:
-                st.info("조건을 만족하는 안전한 단타 종목이 없습니다.")
+                st.info("조건을 만족하는 단타 종목이 없습니다.")
 
             st.divider()
 
-            st.subheader(
-                "📈 [스윙 TOP 10] 20일선 돌파 & 안전성 검증 종목"
-            )
+            st.subheader("📈 [스윙 TOP 10] 20일선 돌파 종목")
             if not df_swing.empty:
                 st.success(f"조건 부합 스윙 {len(df_swing)}개 선정!")
                 st.dataframe(df_swing, use_container_width=True)
             else:
-                st.info("조건을 만족하는 안전한 스윙 종목이 없습니다.")
+                st.info("조건을 만족하는 스윙 종목이 없습니다.")
