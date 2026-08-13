@@ -1,7 +1,7 @@
 import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import BeautifulSoup
+import from bs4 import BeautifulSoup
 import FinanceDataReader as fdr
 import pandas as pd
 import requests
