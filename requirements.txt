@@ -1,3 +1,5 @@
-finance-datareader
-pandas
 streamlit
+FinanceDataReader
+pandas
+requests
+beautifulsoup4
