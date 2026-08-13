@@ -1,7 +1,6 @@
 import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import FinanceDataReader as fdr
 import pandas as pd
 import requests
 import streamlit as st
@@ -41,7 +40,7 @@ st.components.v1.html(
 st.title("💰 이가네황가네 부자되기프로젝트")
 st.caption("장중 차트 수급 + 캔들 모양 + 윗꼬리/역배열 예외 필터링 분석기")
 
-# 사이드바 설정 (스캔 범위 선택)
+# 사이드바 설정
 st.sidebar.header("⚙️ 스캔 범위 설정")
 market_choice = st.sidebar.radio(
     "스캔할 시장을 선택하세요:",
@@ -49,49 +48,74 @@ market_choice = st.sidebar.radio(
 )
 
 
-# 2. KRX 서버 차단을 우회하여 네이버/KIND에서 종목 리스트 불러오기 (1시간 캐싱)
+# 2. 네이버 증권 API 활용한 종목 리스트 수집 (KRX 차단 완벽 회피)
 @st.cache_data(ttl=3600)
 def load_selected_stocks(choice):
+    stocks = {}
+    market = "KOSDAQ" if "KOSDAQ" in choice else "KOSPI"
     try:
-        # 네이버 금융 상장법인 종목 데이터 우회 수집 (KRX 오류 회피)
-        market_code = "kosdaq" if "KOSDAQ" in choice else "kospi"
-        url = f"http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13&marketType={market_code}"
-
-        df = pd.read_html(url, header=0)[0]
-        df["종목코드"] = df["종목코드"].map("{:06d}".format)
-
-        # 스팩, 우량주/우선주 등 제외
-        df = df[~df["회사명"].str.contains("스팩|우|ETF|ETN", na=False)]
-
-        return dict(zip(df["회사명"], df["종목코드"]))
+        # 네이버 증권 API 사용 (가장 안정적)
+        page = 1
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        while page <= 15:  # 상위 주요 종목 수집
+            url = f"https://finance.naver.com/api/sise/itemList.naver?marketType={market}&page={page}"
+            res = requests.get(url, headers=headers, timeout=3).json()
+            items = res.get("result", {}).get("itemList", [])
+            if not items:
+                break
+            for item in items:
+                name = item.get("itemname", "")
+                code = item.get("itemcode", "")
+                # 스팩, 우선주 제외
+                if not any(
+                    x in name for x in ["스팩", "우B", "우C", "ETF", "ETN"]
+                ) and not name.endswith("우"):
+                    stocks[name] = code
+            page += 1
     except Exception as e:
-        # 2차 우회 옵션 (KIND 오류 발생시 FinanceDataReader 기본 옵션)
-        try:
-            market_name = "KOSDAQ" if "KOSDAQ" in choice else "KOSPI"
-            df_krx = fdr.StockListing(market_name)
-            df_krx = df_krx[
-                ~df_krx["Name"].str.contains("스팩|우|ETF|ETN", na=False)
-            ]
-            return dict(zip(df_krx["Name"], df_krx["Code"]))
-        except Exception as e2:
-            st.error(f"종목 목록을 불러오는 중 오류가 발생했습니다: {e2}")
-            return {}
+        st.error(f"종목 목록을 불러오는 중 오류 발생: {e}")
+    return stocks
 
 
 TARGET_STOCKS = load_selected_stocks(market_choice)
 st.sidebar.metric("현재 분석 대상 종목 수", f"{len(TARGET_STOCKS):,} 개")
 
 
-# 3. 개별 종목 분석 함수
-def analyze_single_stock(name, code, start_date):
+# 3. 네이버 일봉 데이터 직접 수집 및 분석 (FinanceDataReader 미사용)
+def analyze_single_stock(name, code):
     try:
-        df = fdr.DataReader(code, start_date)
-        if df is None or len(df) < 60:
+        url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count=100&requestType=0"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        res = requests.get(url, headers=headers, timeout=2)
+
+        # XML 파싱 (네이버 차트)
+        lines = res.text.split("<item data=\"")
+        data_list = []
+        for line in lines[1:]:
+            raw = line.split('"')[0].split("|")
+            if len(raw) >= 6:
+                # 날짜, 시가, 고가, 저가, 종가, 거래량
+                data_list.append(
+                    {
+                        "Date": raw[0],
+                        "Open": float(raw[1]),
+                        "High": float(raw[2]),
+                        "Low": float(raw[3]),
+                        "Close": float(raw[4]),
+                        "Volume": float(raw[5]),
+                    }
+                )
+
+        df = pd.DataFrame(data_list)
+        if len(df) < 50:
             return None
 
         latest = df.iloc[-1]
         prev = df.iloc[-2]
-        latest_date = df.index[-1].strftime("%Y-%m-%d")
 
         c, o, h, l = (
             latest["Close"],
@@ -120,7 +144,7 @@ def analyze_single_stock(name, code, start_date):
             else 0
         )
 
-        # 기술적 지표 계산
+        # 지표 계산
         df["MA20"] = df["Close"].rolling(20).mean()
         df["STD20"] = df["Close"].rolling(20).std()
         df["UpperBB"] = df["MA20"] + (df["STD20"] * 2)
@@ -181,7 +205,7 @@ def analyze_single_stock(name, code, start_date):
             res_dict = {
                 "종목명": name,
                 "종목코드": code,
-                "마감일": latest_date,
+                "마감일": latest["Date"],
                 "캔들 상태": candle_status,
                 "종가": f"{int(c):,}원",
                 "등락률": f"{change:+.2f}%",
@@ -207,13 +231,10 @@ def analyze_single_stock(name, code, start_date):
 # 병렬 스캔 실행 함수
 def run_scanner():
     cb_list, day_list, swing_list = [], [], []
-    today = datetime.datetime.now()
-    start_date = (today - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
 
-    # 스레드 수 2개로 최적화
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [
-            executor.submit(analyze_single_stock, name, code, start_date)
+            executor.submit(analyze_single_stock, name, code)
             for name, code in TARGET_STOCKS.items()
         ]
 
