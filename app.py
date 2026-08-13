@@ -1,10 +1,10 @@
 import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import from bs4 import BeautifulSoup
 import FinanceDataReader as fdr
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup  # 👈 'from bs4 import BeautifulSoup' 형태여야 합니다!
 import streamlit as st
 
 # 1. 페이지 설정
