@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import FinanceDataReader as fdr
 import pandas as pd
+import requests
 import streamlit as st
 
 # 1. 페이지 설정
@@ -48,32 +49,40 @@ market_choice = st.sidebar.radio(
 )
 
 
-# 2. 선택된 시장 종목 불러오기 (1시간 캐싱)
+# 2. KRX 서버 차단을 우회하여 네이버/KIND에서 종목 리스트 불러오기 (1시간 캐싱)
 @st.cache_data(ttl=3600)
 def load_selected_stocks(choice):
     try:
-        df_krx = fdr.StockListing("KRX")
-        filtered = df_krx[
-            (df_krx["Market"].isin(["KOSPI", "KOSDAQ"]))
-            & (~df_krx["Name"].str.contains("우|ETF|ETN|스팩", na=False))
-        ]
+        # 네이버 금융 상장법인 종목 데이터 우회 수집 (KRX 오류 회피)
+        market_code = "kosdaq" if "KOSDAQ" in choice else "kospi"
+        url = f"http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13&marketType={market_code}"
 
-        if "KOSDAQ" in choice:
-            filtered = filtered[filtered["Market"] == "KOSDAQ"]
-        elif "KOSPI" in choice:
-            filtered = filtered[filtered["Market"] == "KOSPI"]
+        df = pd.read_html(url, header=0)[0]
+        df["종목코드"] = df["종목코드"].map("{:06d}".format)
 
-        return dict(zip(filtered["Name"], filtered["Code"]))
+        # 스팩, 우량주/우선주 등 제외
+        df = df[~df["회사명"].str.contains("스팩|우|ETF|ETN", na=False)]
+
+        return dict(zip(df["회사명"], df["종목코드"]))
     except Exception as e:
-        st.error(f"종목 목록을 불러오는 중 오류가 발생했습니다: {e}")
-        return {}
+        # 2차 우회 옵션 (KIND 오류 발생시 FinanceDataReader 기본 옵션)
+        try:
+            market_name = "KOSDAQ" if "KOSDAQ" in choice else "KOSPI"
+            df_krx = fdr.StockListing(market_name)
+            df_krx = df_krx[
+                ~df_krx["Name"].str.contains("스팩|우|ETF|ETN", na=False)
+            ]
+            return dict(zip(df_krx["Name"], df_krx["Code"]))
+        except Exception as e2:
+            st.error(f"종목 목록을 불러오는 중 오류가 발생했습니다: {e2}")
+            return {}
 
 
 TARGET_STOCKS = load_selected_stocks(market_choice)
 st.sidebar.metric("현재 분석 대상 종목 수", f"{len(TARGET_STOCKS):,} 개")
 
 
-# 3. 개별 종목 분석 함수 (초안정성 버전)
+# 3. 개별 종목 분석 함수
 def analyze_single_stock(name, code, start_date):
     try:
         df = fdr.DataReader(code, start_date)
@@ -161,7 +170,11 @@ def analyze_single_stock(name, code, start_date):
         )
 
         if is_high_win_cb or is_day_trade or is_swing:
-            score = vol_ratio * 0.4 + change * 10 + (68 - abs(60 - curr_rsi)) * 2
+            score = (
+                vol_ratio * 0.4
+                + change * 10
+                + (68 - abs(60 - curr_rsi)) * 2
+            )
             if upper_shadow <= body * 0.15:
                 score += 15
 
@@ -197,7 +210,7 @@ def run_scanner():
     today = datetime.datetime.now()
     start_date = (today - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
 
-    # 안정적인 2스레드 처리
+    # 스레드 수 2개로 최적화
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [
             executor.submit(analyze_single_stock, name, code, start_date)
