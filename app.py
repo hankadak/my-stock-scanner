@@ -41,7 +41,7 @@ st.components.v1.html(
 
 st.title("💰 이가네황가네 부자되기프로젝트")
 st.caption(
-    "장중 차트 수급 + 캔들 모양 + 증100/신용불가/200일선 예외 필터링 + 장후 시간외 단일가 통합 분석"
+    "장중 차트 수급 + 캔들 모양 + 200일선 예외 필터링 + 시간외 단일가 안전 스캔"
 )
 
 # 사이드바 설정 (스캔 범위 선택)
@@ -77,27 +77,26 @@ TARGET_STOCKS = load_selected_stocks(market_choice)
 st.sidebar.metric("현재 분석 대상 종목 수", f"{len(TARGET_STOCKS):,} 개")
 
 
-# 3. 네이버 증권에서 시간외 단일가 & 위험 종목(증100/신용불가) 정보 추출
-def get_stock_extra_info(code):
-    """네이버 증권 크롤링: 시간외 단일가 등락률 및 증100/신용불가 여부 확인"""
+# 3. 안전하게 크롤링하는 함수 (에러 발생 시 절대 앱이 죽지 않고 0으로 반환)
+def get_stock_extra_info_safe(code):
     res_data = {"overtime": 0.0, "is_high_risk": False}
     try:
         url = f"https://finance.naver.com/item/main.naver?code={code}"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
-        res = requests.get(url, headers=headers, timeout=3)
+        res = requests.get(url, headers=headers, timeout=1.5)
 
         if res.status_code == 200:
             soup = BeautifulSoup(res.text, "html.parser")
 
-            # 🚨 [위험 필터 1] 증100 또는 신용불가 딱지 체크
-            first_html = res.text[:10000]
+            # 증100/신용불가 필터
+            first_html = res.text[:8000]
             if "증100" in first_html or "신용불가" in first_html:
                 res_data["is_high_risk"] = True
                 return res_data
 
-            # 📈 시간외 단일가 추출
+            # 시간외 단일가
             overtime_section = soup.select_one(".section.overtime")
             if overtime_section:
                 em_tag = overtime_section.select_one("em")
@@ -115,11 +114,12 @@ def get_stock_extra_info(code):
                         val = -abs(val)
                     res_data["overtime"] = val
     except Exception:
+        # 웹 차단이나 네트워크 차단이 나도 앱이 뻗지 않도록 무시하고 진행
         pass
     return res_data
 
 
-# 4. 개별 종목 분석 및 정밀 스캔 함수
+# 4. 개별 종목 분석 함수
 def analyze_single_stock(name, code, start_date):
     try:
         df = fdr.DataReader(code, start_date)
@@ -141,11 +141,11 @@ def analyze_single_stock(name, code, start_date):
         if c < 1000 or latest["Volume"] < 50000:
             return None
 
-        # 🚨 [위험 필터 2] 당일 고점 대비 -15% 이상 폭락한 윗꼬리(설거지) 차단
+        # 🚨 [위험 필터 1] 당일 고점 대비 -15% 이상 폭락한 윗꼬리 차단
         if h > 0 and ((h - c) / h) * 100 >= 15.0:
             return None
 
-        # 🚨 [위험 필터 3] 일봉 200일선 역배열 차단 (데이터가 충분할 때만)
+        # 🚨 [위험 필터 2] 일봉 200일선 역배열 차단
         if len(df) >= 200:
             ma200 = df["Close"].rolling(200).mean().iloc[-1]
             if pd.notna(ma200) and c < ma200:
@@ -166,8 +166,6 @@ def analyze_single_stock(name, code, start_date):
         delta = df["Close"].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-
-        # ZeroDivisionError 방지
         loss = loss.replace(0, 0.00001)
         rs = gain / loss
         df["RSI"] = 100 - (100 / (1 + rs))
@@ -209,11 +207,10 @@ def analyze_single_stock(name, code, start_date):
             and (45 <= curr_rsi <= 60)
         )
 
-        # 조건 부합 시 크롤링 검증
+        # 1차 기술적 조건이 맞는 최정예 종목에 대해서만 안전하게 2차 검증
         if is_high_win_cb or is_day_trade or is_swing:
-            extra_info = get_stock_extra_info(code)
+            extra_info = get_stock_extra_info_safe(code)
 
-            # 증100/신용불가 탈락
             if extra_info["is_high_risk"]:
                 return None
 
@@ -269,23 +266,26 @@ def run_scanner():
     today = datetime.datetime.now()
     start_date = (today - datetime.timedelta(days=300)).strftime("%Y-%m-%d")
 
-    # 안정적인 요청 처리를 위해 max_workers를 8로 조정
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    # 🔥 서버다운 방지를 위해 max_workers를 5로 낮추고 안정성 최우선 세팅
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [
             executor.submit(analyze_single_stock, name, code, start_date)
             for name, code in TARGET_STOCKS.items()
         ]
 
         for future in as_completed(futures):
-            res = future.result()
-            if res:
-                category, data = res
-                if category == "closing_bet":
-                    cb_list.append(data)
-                elif category == "day_trade":
-                    day_list.append(data)
-                elif category == "swing":
-                    swing_list.append(data)
+            try:
+                res = future.result()
+                if res:
+                    category, data = res
+                    if category == "closing_bet":
+                        cb_list.append(data)
+                    elif category == "day_trade":
+                        day_list.append(data)
+                    elif category == "swing":
+                        swing_list.append(data)
+            except Exception:
+                continue
 
     def filter_top10(data_list):
         if not data_list:
