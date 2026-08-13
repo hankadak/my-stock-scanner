@@ -41,14 +41,14 @@ st.components.v1.html(
 
 st.title("💰 이가네황가네 부자되기프로젝트")
 st.caption(
-    "장중 차트 수급 + 캔들 모양 + 200일선 예외 필터링 + 시간외 단일가 안전 스캔"
+    "장중 차트 수급 + 캔들 모양 + 증100/신용불가/60일선 저항 예외 필터링 + 시간외 단일가 스캔"
 )
 
 # 사이드바 설정 (스캔 범위 선택)
 st.sidebar.header("⚙️ 스캔 범위 설정")
 market_choice = st.sidebar.radio(
     "스캔할 시장을 선택하세요:",
-    ["KRX 전체 (약 15~20초)", "KOSDAQ 전종목 (약 10초)", "KOSPI 전종목 (약 8초)"],
+    ["KOSDAQ 전종목 (추천)", "KOSPI 전종목", "KRX 전체 (메모리 주의)"],
 )
 
 
@@ -77,7 +77,7 @@ TARGET_STOCKS = load_selected_stocks(market_choice)
 st.sidebar.metric("현재 분석 대상 종목 수", f"{len(TARGET_STOCKS):,} 개")
 
 
-# 3. 안전하게 크롤링하는 함수 (에러 발생 시 절대 앱이 죽지 않고 0으로 반환)
+# 3. 크롤링 예외 구속 함수
 def get_stock_extra_info_safe(code):
     res_data = {"overtime": 0.0, "is_high_risk": False}
     try:
@@ -89,14 +89,12 @@ def get_stock_extra_info_safe(code):
 
         if res.status_code == 200:
             soup = BeautifulSoup(res.text, "html.parser")
-
-            # 증100/신용불가 필터
             first_html = res.text[:8000]
+
             if "증100" in first_html or "신용불가" in first_html:
                 res_data["is_high_risk"] = True
                 return res_data
 
-            # 시간외 단일가
             overtime_section = soup.select_one(".section.overtime")
             if overtime_section:
                 em_tag = overtime_section.select_one("em")
@@ -114,14 +112,14 @@ def get_stock_extra_info_safe(code):
                         val = -abs(val)
                     res_data["overtime"] = val
     except Exception:
-        # 웹 차단이나 네트워크 차단이 나도 앱이 뻗지 않도록 무시하고 진행
         pass
     return res_data
 
 
-# 4. 개별 종목 분석 함수
+# 4. 개별 종목 분석 함수 (메모리 경량화 버전)
 def analyze_single_stock(name, code, start_date):
     try:
+        # 경량화된 데이터 조회
         df = fdr.DataReader(code, start_date)
         if df is None or len(df) < 60:
             return None
@@ -137,7 +135,7 @@ def analyze_single_stock(name, code, start_date):
             latest["Low"],
         )
 
-        # 동전주 및 극소 거래량 차단
+        # 동전주 및 거래량 미달 차단
         if c < 1000 or latest["Volume"] < 50000:
             return None
 
@@ -145,11 +143,10 @@ def analyze_single_stock(name, code, start_date):
         if h > 0 and ((h - c) / h) * 100 >= 15.0:
             return None
 
-        # 🚨 [위험 필터 2] 일봉 200일선 역배열 차단
-        if len(df) >= 200:
-            ma200 = df["Close"].rolling(200).mean().iloc[-1]
-            if pd.notna(ma200) and c < ma200:
-                return None
+        # 🚨 [위험 필터 2] 일봉 60일 수급선 역배열 차단 (메모리 절약을 위해 60일선 활용)
+        ma60 = df["Close"].rolling(60).mean().iloc[-1]
+        if pd.notna(ma60) and c < ma60:
+            return None
 
         change = ((c - prev["Close"]) / prev["Close"]) * 100
         vol_ratio = (
@@ -207,7 +204,7 @@ def analyze_single_stock(name, code, start_date):
             and (45 <= curr_rsi <= 60)
         )
 
-        # 1차 기술적 조건이 맞는 최정예 종목에 대해서만 안전하게 2차 검증
+        # 조건 충족 종목만 크롤링 검증
         if is_high_win_cb or is_day_trade or is_swing:
             extra_info = get_stock_extra_info_safe(code)
 
@@ -264,10 +261,11 @@ def analyze_single_stock(name, code, start_date):
 def run_scanner():
     cb_list, day_list, swing_list = [], [], []
     today = datetime.datetime.now()
-    start_date = (today - datetime.timedelta(days=300)).strftime("%Y-%m-%d")
+    # ⚡ [메모리 절약 핵심] 수집 기간을 120일로 대폭 축소하여 메모리 다운 방지
+    start_date = (today - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
 
-    # 🔥 서버다운 방지를 위해 max_workers를 5로 낮추고 안정성 최우선 세팅
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    # 쓰레드 4개로 제한하여 안정성 극대화
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [
             executor.submit(analyze_single_stock, name, code, start_date)
             for name, code in TARGET_STOCKS.items()
@@ -307,7 +305,7 @@ if st.button("🚀 안전필터 적용 TOP 10 정밀 스캔 시작", type="prima
         st.error("종목 목록을 불러오지 못했습니다.")
     else:
         with st.spinner(
-            "증100/신용불가/역배열 필터링 + 시간외 단일가 검증 중..."
+            "증100/신용불가/60일선 필터링 + 시간외 단일가 검증 중..."
         ):
             df_cb, df_day, df_swing = run_scanner()
 
