@@ -11,9 +11,7 @@ st.set_page_config(
     page_title="이가네황가네 부자되기프로젝트", page_icon="🎯", layout="wide"
 )
 
-# -------------------------------------------------------------------
-# 🔥 [화면 꺼짐 방지] 스마트폰 화면 자동 잠금/꺼짐 방지 스크립트
-# -------------------------------------------------------------------
+# 화면 꺼짐 방지 스크립트
 st.components.v1.html(
     """
     <script>
@@ -39,7 +37,7 @@ st.components.v1.html(
 )
 
 st.title("💰 이가네황가네 부자되기프로젝트")
-st.caption("장중 차트 수급 + 캔들 모양 + 증100/신용불가/200일선/윗꼬리 정밀 필터링 분석기")
+st.caption("장중 차트 수급 + 캔들 모양 + 증100/신용불가/설거지 윗꼬리 정밀 필터링 분석기")
 
 # 사이드바 설정
 st.sidebar.header("⚙️ 스캔 범위 설정")
@@ -102,11 +100,8 @@ TARGET_STOCKS = load_selected_stocks(market_choice)
 st.sidebar.metric("현재 분석 대상 종목 수", f"{len(TARGET_STOCKS):,} 개")
 
 
-# -------------------------------------------------------------------
-# 🔥 [안전 필터 1] 증100 · 신용불가 사전 차단 (네이버 크롤링 연동)
-# -------------------------------------------------------------------
+# 3. 증100 · 신용불가 크롤링 필터
 def get_stock_risk_info(code):
-    """네이버 증권 페이지에서 증100 또는 신용불가 여부 크롤링"""
     try:
         url = f"https://finance.naver.com/item/main.naver?code={code}"
         headers = {
@@ -114,20 +109,18 @@ def get_stock_risk_info(code):
         }
         res = requests.get(url, headers=headers, timeout=1.5)
         if res.status_code == 200:
-            # 상단 태그/배너 영역 텍스트 검사
             first_html = res.text[:12000]
             if "증100" in first_html or "신용불가" in first_html:
-                return True  # 위험 종목 맞음
+                return True
     except Exception:
         pass
-    return False  # 정상 종목 (또는 확인 불가시 통과)
+    return False
 
 
-# 4. 개별 종목 정밀 분석 함수
+# 4. 개별 종목 분석 함수 (실현 가능한 안전 조건 적용)
 def analyze_single_stock(name, code):
     try:
-        # 200일선 계산을 위해 충분한 300일 치 데이터 요청
-        url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count=300&requestType=0"
+        url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count=250&requestType=0"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
@@ -153,7 +146,7 @@ def analyze_single_stock(name, code):
                 )
 
         df = pd.DataFrame(data_list)
-        if len(df) < 60:  # 최소 데이터 검증
+        if len(df) < 60:
             return None
 
         latest = df.iloc[-1]
@@ -166,30 +159,16 @@ def analyze_single_stock(name, code):
             latest["Low"],
         )
 
-        # 동전주 및 극소 거래량 즉시 차단
+        # 동전주 및 소형 거래량 차단
         if c < 1000 or latest["Volume"] < 30000:
             return None
 
         body = abs(c - o)
         upper_shadow = h - max(o, c)
 
-        # -------------------------------------------------------------
-        # 🚨 [안전 필터 2] 고점 대비 과도한 윗꼬리(설거지) 필터 강화
-        # -------------------------------------------------------------
-        # 1) 당일 고점 대비 현재 주가가 -15% 이상 폭락했거나
+        # 🚨 [안전 필터 1] 당일 고점 대비 -15% 이상 폭락한 진짜 설거지 윗꼬리만 차단
         if h > 0 and ((h - c) / h) * 100 >= 15.0:
             return None
-        # 2) 윗꼬리 길이가 몸통(Body)보다 길 경우 '물량 넘기기'로 간주하여 필터링
-        if upper_shadow > body:
-            return None
-
-        # -------------------------------------------------------------
-        # 🚨 [안전 필터 3] 장기 역배열(200일선) 저항 필터 추가
-        # -------------------------------------------------------------
-        if len(df) >= 200:
-            ma200 = df["Close"].rolling(200).mean().iloc[-1]
-            if pd.notna(ma200) and c < ma200:
-                return None  # 머리 위 강한 200일선 저항이 존재하므로 탈락
 
         change = ((c - prev["Close"]) / prev["Close"]) * 100
         vol_ratio = (
@@ -198,7 +177,7 @@ def analyze_single_stock(name, code):
             else 0
         )
 
-        # 기술적 지표 계산
+        # 지표 계산
         df["MA20"] = df["Close"].rolling(20).mean()
         df["STD20"] = df["Close"].rolling(20).std()
         df["UpperBB"] = df["MA20"] + (df["STD20"] * 2)
@@ -213,7 +192,7 @@ def analyze_single_stock(name, code):
         curr_rsi = df["RSI"].iloc[-1]
         curr_upper_bb = df["UpperBB"].iloc[-1]
 
-        if upper_shadow <= body * 0.2:
+        if upper_shadow <= body * 0.3:
             candle_status = "🔥 장대양봉(최상)"
         else:
             candle_status = "👍 양봉(양호)"
@@ -221,35 +200,39 @@ def analyze_single_stock(name, code):
         target_price = int(c * 1.05)
         stop_price = int(c * 0.97)
 
-        # 전략 조건
+        # -------------------------------------------------------------
+        # ⚙️ [현실적인 수급 인정 조건]
+        # -------------------------------------------------------------
+        
+        # 1. 종가베팅: 거래량 150% 이상 + 볼린저 상단 근접/돌파 + RSI 48 이상 + 양봉
         is_high_win_cb = (
-            (c >= curr_upper_bb * 0.98)
+            (c >= curr_upper_bb * 0.97)
             and (vol_ratio >= 150)
-            and (50 <= curr_rsi <= 75)
+            and (curr_rsi >= 48)
             and (c > o)
             and (change >= 2.0)
         )
 
+        # 2. 단타: 전일 고점 돌파 + 거래량 120% 이상 + 등락률 2% 이상
         is_day_trade = (
             (vol_ratio >= 120)
             and (c > prev["High"])
-            and (curr_rsi >= 50)
+            and (curr_rsi >= 45)
             and (change >= 2.0)
         )
 
+        # 3. 스윙: 주가가 20일선 위에 안착 + RSI 45~68
         is_swing = (
             (c > df["MA20"].iloc[-1])
             and (vol_ratio >= 100)
-            and (45 <= curr_rsi <= 65)
+            and (45 <= curr_rsi <= 68)
             and (change >= 0.5)
         )
 
-        # -------------------------------------------------------------
-        # 🚨 [안전 필터 1 실행] 1차 조건 통과 종목만 크롤링으로 증100/신용불가 검증
-        # -------------------------------------------------------------
+        # 1차 조건 충족 종목만 증100 / 신용불가 위험 종목 검증
         if is_high_win_cb or is_day_trade or is_swing:
             if get_stock_risk_info(code):
-                return None  # 증100 또는 신용불가 딱지가 붙은 위험 종목 탈락!
+                return None  # 증100/신용불가 딱지 붙은 위험 종목 제외
 
             score = (
                 vol_ratio * 0.3
@@ -289,7 +272,6 @@ def analyze_single_stock(name, code):
 def run_scanner():
     cb_list, day_list, swing_list = [], [], []
 
-    # 안전을 위해 max_workers=5 설정
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [
             executor.submit(analyze_single_stock, name, code)
@@ -329,7 +311,7 @@ if st.button("🚀 안전필터 적용 TOP 10 정밀 스캔 시작", type="prima
     if not TARGET_STOCKS:
         st.error("종목 목록을 불러오지 못했습니다.")
     else:
-        with st.spinner("증100/신용불가 + 200일선 저항 + 설거지 윗꼬리 필터링 검증 중..."):
+        with st.spinner("증100/신용불가 + 설거지 윗꼬리 필터링 검증 중..."):
             df_cb, df_day, df_swing = run_scanner()
 
             st.subheader("🔥 [종가베팅 TOP 10] 볼린저상단 근접/돌파 & 안전 검증 종목")
