@@ -1,3 +1,4 @@
+Python
 import os
 import time
 import requests
@@ -17,6 +18,7 @@ st.set_page_config(
     layout="wide"
 )
 
+# 모바일/PC 화면 꺼짐 방지 WakeLock 스크립트
 st.components.v1.html(
     """
     <script>
@@ -26,7 +28,9 @@ st.components.v1.html(
         if ('wakeLock' in navigator) {
           wakeLock = await navigator.wakeLock.request('screen');
         }
-      } catch (err) {}
+      } catch (err) {
+        console.log(err);
+      }
     }
     requestWakeLock();
     document.addEventListener('visibilitychange', async () => {
@@ -40,12 +44,45 @@ st.components.v1.html(
 )
 
 st.title("💰 이가네황가네 부자되기프로젝트 Pro")
-st.caption("매수가·예상매도가·손절가 자동 산출 & 텔레그램 연동 주식 분석기")
+st.caption("장중 차트 수급 + 캔들 모양 + 증100/신용불가/설거지 윗꼬리 정밀 필터링 & 텔레그램 연동 분석기")
 
 # ==========================================
-# 2. 위험 종목 및 시간외 크롤러
+# 2. 텔레그램 설정
+# ==========================================
+TELEGRAM_TOKEN = "8618282274:AAHUkmIRnrcIh5MpwthOAHZEnOKmVOQUr2I"
+TELEGRAM_CHAT_ID = "8910793924"
+
+st.sidebar.header("⚙️ 스캔 및 알림 설정")
+enable_telegram = st.sidebar.checkbox("📱 포착 종목 텔레그램 전송", value=True)
+
+market_choice = st.sidebar.radio(
+    "스캔할 시장을 선택하세요:",
+    ["KOSDAQ 전종목 (추천)", "KOSPI 전종목"],
+)
+
+def send_telegram_msg(message, buttons=None):
+    """텔레그램 메시지 및 인라인 버튼 전송 함수"""
+    if not enable_telegram:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True
+    }
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": buttons}
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        print("⚠️ 텔레그램 전송 에러:", e)
+
+# ==========================================
+# 3. 네이버 증권 시간외 단일가 & 위험 종목 크롤러
 # ==========================================
 def get_overtime_change(code):
+    """네이버 증권에서 실시간 시간외 단일가 등락률 수집"""
     try:
         url = f"https://finance.naver.com/item/main.naver?code={code}"
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -66,6 +103,7 @@ def get_overtime_change(code):
     return 0.0
 
 def get_stock_risk_info(code):
+    """증100 / 신용불가 위험 종목 여부 필터링"""
     try:
         url = f"https://finance.naver.com/item/main.naver?code={code}"
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -79,7 +117,7 @@ def get_stock_risk_info(code):
     return False
 
 # ==========================================
-# 3. 종목 리스트 로드
+# 4. 종목 리스트 수집 함수 (KRX / Naver API)
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_selected_stocks(choice):
@@ -119,7 +157,7 @@ TARGET_STOCKS = load_selected_stocks(market_choice)
 st.sidebar.metric("현재 분석 대상 종목 수", f"{len(TARGET_STOCKS):,} 개")
 
 # ==========================================
-# 4. 가격 계산 및 종목 정밀 분석
+# 5. 개별 종목 정밀 정량 및 수급 분석
 # ==========================================
 def analyze_single_stock(item):
     code, name = item
@@ -151,21 +189,21 @@ def analyze_single_stock(item):
         c, o, h, l = latest["Close"], latest["Open"], latest["High"], latest["Low"]
         trading_value = c * latest["Volume"]
 
+        # 동전주(1,000원 미만) 및 거래대금 10억 미만 필터링
         if c < 1000 or trading_value < 1000000000:
             return None
 
         body = abs(c - o)
         upper_shadow = h - max(o, c)
 
-        # 윗꼬리 필터 (-10% 이상 탈락)
+        # 🚨 [안전 필터] 당일 고점 대비 -10% 이상 밀린 설거지 윗꼬리 차단
         if h > 0 and ((h - c) / h) * 100 >= 10.0:
             return None
 
         change = ((c - prev["Close"]) / prev["Close"]) * 100
         vol_ratio = (latest["Volume"] / prev["Volume"]) * 100 if prev["Volume"] > 0 else 0
 
-        # 지표 산출
-        df["MA5"] = df["Close"].rolling(5).mean()
+        # 보조 지표 계산 (MA, 볼린저밴드, RSI)
         df["MA20"] = df["Close"].rolling(20).mean()
         df["STD20"] = df["Close"].rolling(20).std()
         df["UpperBB"] = df["MA20"] + (df["STD20"] * 2)
@@ -180,27 +218,17 @@ def analyze_single_stock(item):
         curr_rsi = df["RSI"].iloc[-1]
         curr_upper_bb = df["UpperBB"].iloc[-1]
 
-        # 🎯 가격 계산 로직 (매수가, 예상매도가, 손절가)
-        buy_price = int(c)  # 종가/현재가 기준
-        
-        # 1) 종가베팅 가격 전략 (+4% ~ +5% 목표 / -3% 손절)
-        cb_target = int(buy_price * 1.045)
-        cb_stop = int(buy_price * 0.97)
+        candle_status = "🔥 장대양봉(최상)" if upper_shadow <= body * 0.3 else "👍 양봉(양호)"
+        target_price = int(c * 1.05)
+        stop_price = int(c * 0.97)
 
-        # 2) 단타 가격 전략 (+3% ~ +4% 목표 / -2.5% 손절)
-        day_target = int(buy_price * 1.035)
-        day_stop = int(buy_price * 0.975)
-
-        # 3) 스윙 가격 전략 (+7% ~ +8% 목표 / 20일선 지지 기준 -4% 손절)
-        swing_target = int(buy_price * 1.075)
-        swing_stop = min(int(df["MA20"].iloc[-1]), int(buy_price * 0.96))
-
-        # 전략 조건
+        # ⚙️ 전략 필터링
         is_high_win_cb = (c >= curr_upper_bb * 0.97) and (vol_ratio >= 150) and (curr_rsi >= 48) and (c > o) and (change >= 2.0)
         is_day_trade = (vol_ratio >= 120) and (c > prev["High"]) and (curr_rsi >= 45) and (change >= 2.0)
         is_swing = (c > df["MA20"].iloc[-1]) and (vol_ratio >= 100) and (45 <= curr_rsi <= 68) and (change >= 0.5)
 
         if is_high_win_cb or is_day_trade or is_swing:
+            # 위험 종목(증100/신용불가) 크롤링 검증
             if get_stock_risk_info(code):
                 return None
 
@@ -213,27 +241,26 @@ def analyze_single_stock(item):
             res_dict = {
                 "종목명": name,
                 "종목코드": code,
-                "현재가/종가": f"{int(c):,}원",
+                "마감일": latest["Date"],
+                "캔들 상태": candle_status,
+                "종가": f"{int(c):,}원",
                 "등락률": f"{change:+.2f}%",
-                "추천매수가": f"{buy_price:,}원",
-                "예상매도가": "",
-                "손절가": "",
-                "거래대금": f"{acc_amount_eon:,}억 원",
                 "RSI": f"{curr_rsi:.1f}",
-                "_score": score
+                "거래대금": f"{acc_amount_eon:,}억 원",
+                "목표가(+5%)": f"{target_price:,}원",
+                "손절가(-3%)": f"{stop_price:,}원",
+                "_score": score,
+                "_raw_close": int(c),
+                "_raw_change": change,
+                "_raw_eon": acc_amount_eon
             }
 
             if is_high_win_cb:
-                res_dict["예상매도가"] = f"{cb_target:,}원 (+4.5%)"
-                res_dict["손절가"] = f"{cb_stop:,}원 (-3.0%)"
                 return ("closing_bet", res_dict)
             elif is_day_trade:
-                res_dict["예상매도가"] = f"{day_target:,}원 (+3.5%)"
-                res_dict["손절가"] = f"{day_stop:,}원 (-2.5%)"
                 return ("day_trade", res_dict)
             elif is_swing:
-                res_dict["예상매도가"] = f"{swing_target:,}원 (+7.5%)"
-                res_dict["손절가"] = f"{swing_stop:,}원"
+                res_dict["목표가(+7%)"] = f"{int(c * 1.07):,}원"
                 return ("swing", res_dict)
 
     except Exception:
@@ -241,7 +268,7 @@ def analyze_single_stock(item):
     return None
 
 # ==========================================
-# 5. 스캐너 및 텔레그램 실행
+# 6. 병렬 스캔 및 텔레그램 전송 스케줄러
 # ==========================================
 def run_scanner():
     cb_list, day_list, swing_list = [], [], []
@@ -268,66 +295,68 @@ def run_scanner():
             return pd.DataFrame()
         df = pd.DataFrame(data_list)
         df = df.sort_values(by="_score", ascending=False).head(10)
-        return df.drop(columns=["_score"], errors="ignore")
+        return df.drop(columns=["_score", "_raw_close", "_raw_change", "_raw_eon"], errors="ignore")
 
     df_cb = filter_top10(cb_list)
     df_day = filter_top10(day_list)
     df_swing = filter_top10(swing_list)
 
-    # 텔레그램 알림 전송 (매수가, 예상매도가, 손절가 포함)
-    if enable_telegram and not df_cb.empty:
-        top_item = df_cb.iloc[0]
-        code = top_item["종목코드"]
-        name = top_item["종목명"]
-        ot_val = get_overtime_change(code)
-        ot_str = f"+{ot_val:.2f}%" if ot_val > 0 else f"{ot_val:.2f}%"
-        naver_url = f"https://m.stock.naver.com/stock/{code}/total"
-        buttons = [[{"text": f"📈 {name} 차트 확인하기", "url": naver_url}]]
-        
-        msg = (
-            f"🌙 *[이가네황가네 - 종가베팅 TOP 포착!]*\n\n"
-            f"• *종목명:* {name} ({code})\n"
-            f"• *현재가:* {top_item['현재가/종가']} (`{top_item['등락률']}`)\n"
-            f"• *시간외 단일가:* *`{ot_str}`*\n"
-            f"• *거래대금:* `{top_item['거래대금']}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📌 *[실전 매매 가격 가이드]*\n"
-            f"🟢 *추천매수가:* {top_item['추천매수가']}\n"
-            f"🎯 *예상매도가:* {top_item['예상매도가']}\n"
-            f"🛑 *손절가:* {top_item['손절가']}"
-        )
-        send_telegram_msg(msg, buttons)
+    # 🎯 포착된 TOP 1 종목 텔레그램 실시간 알림 전송
+    if enable_telegram:
+        if not df_cb.empty:
+            top_item = df_cb.iloc[0]
+            code = top_item["종목코드"]
+            name = top_item["종목명"]
+            ot_val = get_overtime_change(code)
+            ot_str = f"+{ot_val:.2f}%" if ot_val > 0 else f"{ot_val:.2f}%"
+            naver_url = f"https://m.stock.naver.com/stock/{code}/total"
+            buttons = [[{"text": f"📈 {name} 차트 확인하기", "url": naver_url}]]
+            
+            msg = (
+                f"🌙 *[이가네황가네 - 종가베팅 TOP 포착!]*\n\n"
+                f"• *종목명:* {name} ({code})\n"
+                f"• *종가:* {top_item['종가']} (`{top_item['등락률']}`)\n"
+                f"• *시간외 단일가:* *`{ot_str}`*\n"
+                f"• *거래대금:* `{top_item['거래대금']}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📌 *[익일 매매 가이드]*\n"
+                f"🟢 *목표가:* {top_item['목표가(+5%)']} / 🛑 *손절가:* {top_item['손절가(-3%)']}"
+            )
+            send_telegram_msg(msg, buttons)
 
     return df_cb, df_day, df_swing
 
 # ==========================================
-# 6. 메인 화면 UI
+# 7. 메인 화면 UI
 # ==========================================
-if st.button("🚀 매수가·목표가·손절가 포함 정밀 스캔 시작", type="primary"):
+if st.button("🚀 안전필터 적용 TOP 10 정밀 스캔 & 텔레그램 발송 시작", type="primary"):
     if not TARGET_STOCKS:
         st.error("종목 목록을 불러오지 못했습니다.")
     else:
-        with st.spinner("가격 전략 및 위험 종목 정밀 검증 중..."):
+        with st.spinner("증100/신용불가 + 설거지 윗꼬리 정밀 검증 중..."):
             df_cb, df_day, df_swing = run_scanner()
 
-            st.subheader("🔥 [종가베팅 TOP 10] 볼린저상단 근접/돌파 종목")
+            st.subheader("🔥 [종가베팅 TOP 10] 볼린저상단 근접/돌파 & 안전 검증 종목")
             if not df_cb.empty:
+                st.success(f"조건 부합 종가베팅 {len(df_cb)}개 선정!")
                 st.dataframe(df_cb, use_container_width=True)
             else:
-                st.info("조건을 완벽히 부합하는 종가베팅 종목이 없습니다.")
+                st.info("조건을 완벽히 부합하는 안전한 종가베팅 종목이 없습니다.")
 
             st.divider()
 
-            st.subheader("⚡ [단타 TOP 10] 전일 고점 돌파 종목")
+            st.subheader("⚡ [단타 TOP 10] 전일 고점 돌파 & 안전 검증 종목")
             if not df_day.empty:
+                st.success(f"조건 부합 단타 {len(df_day)}개 선정!")
                 st.dataframe(df_day, use_container_width=True)
             else:
-                st.info("조건을 만족하는 단타 종목이 없습니다.")
+                st.info("조건을 만족하는 안전한 단타 종목이 없습니다.")
 
             st.divider()
 
-            st.subheader("📈 [스윙 TOP 10] 20일선 위 정배열 종목")
+            st.subheader("📈 [스윙 TOP 10] 20일선 위 정배열 & 안전 검증 종목")
             if not df_swing.empty:
+                st.success(f"조건 부합 스윙 {len(df_swing)}개 선정!")
                 st.dataframe(df_swing, use_container_width=True)
             else:
-                st.info("조건을 만족하는 스윙 종목이 없습니다.")
+                st.info("조건을 만족하는 안전한 스윙 종목이 없습니다.")
