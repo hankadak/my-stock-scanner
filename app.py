@@ -9,35 +9,12 @@ import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==========================================
-# 1. 페이지 설정 및 화면 꺼짐 방지 (Mobile/PC)
+# 1. 페이지 기본 설정
 # ==========================================
 st.set_page_config(
     page_title="이가네황가네 부자되기프로젝트 Pro", 
     page_icon="🎯", 
     layout="wide"
-)
-
-# 모바일 화면 꺼짐 방지 스크립트
-st.components.v1.html(
-    """
-    <script>
-    let wakeLock = null;
-    async function requestWakeLock() {
-      try {
-        if ('wakeLock' in navigator) {
-          wakeLock = await navigator.wakeLock.request('screen');
-        }
-      } catch (err) {}
-    }
-    requestWakeLock();
-    document.addEventListener('visibilitychange', async () => {
-      if (wakeLock !== null && document.visibilityState === 'visible') {
-        await requestWakeLock();
-      }
-    });
-    </script>
-    """,
-    height=0,
 )
 
 st.title("💰 이가네황가네 부자되기프로젝트 Pro")
@@ -142,21 +119,18 @@ def analyze_single_stock(item):
         c, o, h, l = latest["Close"], latest["Open"], latest["High"], latest["Low"]
         trading_value = c * latest["Volume"]
 
-        # 기본 필터: 주가 1,000원 이상, 거래대금 10억 이상
         if c < 1000 or trading_value < 1000000000:
             return None
 
         body = abs(c - o)
         upper_shadow = h - max(o, c)
 
-        # 윗꼬리 감지 필터 (고점 대비 -10% 이상 하락 시 완전 제외)
         if h > 0 and ((h - c) / h) * 100 >= 10.0:
             return None
 
         change = ((c - prev["Close"]) / prev["Close"]) * 100
         vol_ratio = (latest["Volume"] / prev["Volume"]) * 100 if prev["Volume"] > 0 else 0
 
-        # 보조지표 계산 (볼린저밴드, RSI)
         df["MA5"] = df["Close"].rolling(5).mean()
         df["MA20"] = df["Close"].rolling(20).mean()
         df["STD20"] = df["Close"].rolling(20).std()
@@ -172,22 +146,17 @@ def analyze_single_stock(item):
         curr_rsi = df["RSI"].iloc[-1]
         curr_upper_bb = df["UpperBB"].iloc[-1]
 
-        # 🎯 매매 가격 자동 산출 로직
-        buy_price = int(c)  # 추천 매수가 (현재 종가 기준)
+        buy_price = int(c)
         
-        # 1) 종가베팅 가격 전략 (+4.5% / -3.0%)
         cb_target = int(buy_price * 1.045)
         cb_stop = int(buy_price * 0.97)
 
-        # 2) 단타 가격 전략 (+3.5% / -2.5%)
         day_target = int(buy_price * 1.035)
         day_stop = int(buy_price * 0.975)
 
-        # 3) 스윙 가격 전략 (+7.5% / 20일 이동평균선 또는 -4.0%)
         swing_target = int(buy_price * 1.075)
         swing_stop = min(int(df["MA20"].iloc[-1]), int(buy_price * 0.96))
 
-        # 전략 조건
         is_high_win_cb = (c >= curr_upper_bb * 0.97) and (vol_ratio >= 150) and (curr_rsi >= 48) and (c > o) and (change >= 2.0)
         is_day_trade = (vol_ratio >= 120) and (c > prev["High"]) and (curr_rsi >= 45) and (change >= 2.0)
         is_swing = (c > df["MA20"].iloc[-1]) and (vol_ratio >= 100) and (45 <= curr_rsi <= 68) and (change >= 0.5)
