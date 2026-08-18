@@ -9,7 +9,7 @@ import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==========================================
-# 1. 페이지 설정 및 화면 꺼짐 방지
+# 1. 페이지 설정 및 화면 꺼짐 방지 (Mobile/PC)
 # ==========================================
 st.set_page_config(
     page_title="이가네황가네 부자되기프로젝트 Pro", 
@@ -17,6 +17,7 @@ st.set_page_config(
     layout="wide"
 )
 
+# 모바일 화면 꺼짐 방지 스크립트
 st.components.v1.html(
     """
     <script>
@@ -53,7 +54,7 @@ market_choice = st.sidebar.radio(
 )
 
 # ==========================================
-# 3. 위험 종목 확인
+# 3. 위험 종목 검증 (증100 / 신용불가)
 # ==========================================
 def get_stock_risk_info(code):
     try:
@@ -69,7 +70,7 @@ def get_stock_risk_info(code):
     return False
 
 # ==========================================
-# 4. 종목 리스트 로드
+# 4. 종목 리스트 로드 (캐싱 지원)
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_selected_stocks(choice):
@@ -109,7 +110,7 @@ TARGET_STOCKS = load_selected_stocks(market_choice)
 st.sidebar.metric("현재 분석 대상 종목 수", f"{len(TARGET_STOCKS):,} 개")
 
 # ==========================================
-# 5. 가격 계산 및 종목 정밀 분석
+# 5. 종목 정밀 분석 및 매수가/목표가/손절가 계산
 # ==========================================
 def analyze_single_stock(item):
     code, name = item
@@ -141,18 +142,21 @@ def analyze_single_stock(item):
         c, o, h, l = latest["Close"], latest["Open"], latest["High"], latest["Low"]
         trading_value = c * latest["Volume"]
 
+        # 기본 필터: 주가 1,000원 이상, 거래대금 10억 이상
         if c < 1000 or trading_value < 1000000000:
             return None
 
         body = abs(c - o)
         upper_shadow = h - max(o, c)
 
+        # 윗꼬리 감지 필터 (고점 대비 -10% 이상 하락 시 완전 제외)
         if h > 0 and ((h - c) / h) * 100 >= 10.0:
             return None
 
         change = ((c - prev["Close"]) / prev["Close"]) * 100
         vol_ratio = (latest["Volume"] / prev["Volume"]) * 100 if prev["Volume"] > 0 else 0
 
+        # 보조지표 계산 (볼린저밴드, RSI)
         df["MA5"] = df["Close"].rolling(5).mean()
         df["MA20"] = df["Close"].rolling(20).mean()
         df["STD20"] = df["Close"].rolling(20).std()
@@ -168,17 +172,22 @@ def analyze_single_stock(item):
         curr_rsi = df["RSI"].iloc[-1]
         curr_upper_bb = df["UpperBB"].iloc[-1]
 
-        buy_price = int(c)
+        # 🎯 매매 가격 자동 산출 로직
+        buy_price = int(c)  # 추천 매수가 (현재 종가 기준)
         
+        # 1) 종가베팅 가격 전략 (+4.5% / -3.0%)
         cb_target = int(buy_price * 1.045)
         cb_stop = int(buy_price * 0.97)
 
+        # 2) 단타 가격 전략 (+3.5% / -2.5%)
         day_target = int(buy_price * 1.035)
         day_stop = int(buy_price * 0.975)
 
+        # 3) 스윙 가격 전략 (+7.5% / 20일 이동평균선 또는 -4.0%)
         swing_target = int(buy_price * 1.075)
         swing_stop = min(int(df["MA20"].iloc[-1]), int(buy_price * 0.96))
 
+        # 전략 조건
         is_high_win_cb = (c >= curr_upper_bb * 0.97) and (vol_ratio >= 150) and (curr_rsi >= 48) and (c > o) and (change >= 2.0)
         is_day_trade = (vol_ratio >= 120) and (c > prev["High"]) and (curr_rsi >= 45) and (change >= 2.0)
         is_swing = (c > df["MA20"].iloc[-1]) and (vol_ratio >= 100) and (45 <= curr_rsi <= 68) and (change >= 0.5)
@@ -224,7 +233,7 @@ def analyze_single_stock(item):
     return None
 
 # ==========================================
-# 6. 스캐너 실행
+# 6. 스캐너 메인 실행기 (병렬 처리)
 # ==========================================
 def run_scanner():
     cb_list, day_list, swing_list = [], [], []
@@ -260,7 +269,7 @@ def run_scanner():
     return df_cb, df_day, df_swing
 
 # ==========================================
-# 7. 메인 화면 UI
+# 7. 웹 UI 레이아웃 출력
 # ==========================================
 if st.button("🚀 매수가·목표가·손절가 포함 정밀 스캔 시작", type="primary"):
     if not TARGET_STOCKS:
