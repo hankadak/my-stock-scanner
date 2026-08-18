@@ -81,7 +81,7 @@ def load_selected_stocks(choice):
     except Exception:
         pass
 
-    # 네트워크 오차로 백업용 종목 목록이 필요한 경우
+    # 네트워크 오차 대비 백업 종목 리스트
     if not stocks:
         if market == "KOSDAQ":
             stocks = {
@@ -166,8 +166,9 @@ def analyze_single_stock(name, code):
             latest["Low"],
         )
 
-        # 동전주 및 소형 거래량 차단
-        if c < 1000 or latest["Volume"] < 30000:
+        # 동전주(1,000원 미만) 및 당일 거래대금 10억 미만 제외
+        trading_value = c * latest["Volume"]
+        if c < 1000 or trading_value < 1000000000:
             return None
 
         body = abs(c - o)
@@ -184,7 +185,7 @@ def analyze_single_stock(name, code):
             else 0
         )
 
-        # 지표 계산 (MA, 볼린저밴드, RSI)
+        # 지표 연산 (이동평균, 볼린저밴드, RSI)
         df["MA20"] = df["Close"].rolling(20).mean()
         df["STD20"] = df["Close"].rolling(20).std()
         df["UpperBB"] = df["MA20"] + (df["STD20"] * 2)
@@ -238,7 +239,7 @@ def analyze_single_stock(name, code):
         # 위험 종목(증100/신용불가) 크롤링 검증
         if is_high_win_cb or is_day_trade or is_swing:
             if get_stock_risk_info(code):
-                return None  # 위험 종목 제외
+                return None  # 부실/위험 종목 제외
 
             score = (
                 vol_ratio * 0.3
@@ -274,12 +275,13 @@ def analyze_single_stock(name, code):
     return None
 
 # ==========================================
-# 5. 병렬 스캔 실행 함수
+# 5. 병렬 스캔 실행 함수 (속도 최적화)
 # ==========================================
 def run_scanner():
     cb_list, day_list, swing_list = [], [], []
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    # max_workers=10으로 병렬 탐색 속도 향상
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [
             executor.submit(analyze_single_stock, name, code)
             for name, code in TARGET_STOCKS.items()
