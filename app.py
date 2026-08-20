@@ -1,270 +1,198 @@
 import os
-import time
 import requests
-from datetime import datetime
-from bs4 import BeautifulSoup
 import pandas as pd
 import FinanceDataReader as fdr
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 # ==========================================
-# 1. 페이지 기본 설정
+# 1. 페이지 및 타이틀 설정
 # ==========================================
 st.set_page_config(
-    page_title="이가네황가네 부자되기프로젝트 Pro", 
-    page_icon="🎯", 
+    page_title="이가네황가네 Pro V2 - 스마트 필터", 
+    page_icon="🛡️", 
     layout="wide"
 )
 
-st.title("💰 이가네황가네 부자되기프로젝트 Pro")
-st.caption("매수가·예상매도가·손절가 자동 산출 주식 분석기")
+st.title("🛡️ 스마트 필터 V2: 지수 연동 & 모멘텀 스캐너")
+st.caption("하락장 매매 강제 차단(Kill Switch) 및 당일 주도 섹터(키워드) 필터링 탑재")
 
 # ==========================================
-# 2. 사이드바 UI 설정
+# 2. 시장 안전장치 (Kill Switch) - 지수 체크
 # ==========================================
-st.sidebar.header("⚙️ 스캔 설정")
+@st.cache_data(ttl=600)
+def check_market_trend(market="KOSDAQ"):
+    """
+    코스피/코스닥 지수의 5일 이동평균선과 당일 등락을 확인하여
+    매매 가능 여부(Kill Switch)를 판별합니다.
+    """
+    symbol = "KS11" if market == "KOSPI" else "KQ11"
+    try:
+        # 최근 10일치 지수 데이터
+        df_index = fdr.DataReader(symbol).tail(10)
+        if len(df_index) < 5: return True, "데이터 부족"
+        
+        df_index["MA5"] = df_index["Close"].rolling(5).mean()
+        
+        latest = df_index.iloc[-1]
+        prev = df_index.iloc[-2]
+        
+        c = latest["Close"]
+        o = latest["Open"]
+        ma5 = latest["MA5"]
+        
+        change_pct = ((c - prev["Close"]) / prev["Close"]) * 100
+        
+        # [위험 조건] 1. 당일 지수가 음봉이면서 하락 중 / 2. 지수가 5일선 아래
+        if c < o and change_pct < -0.5:
+            return False, f"🚨 {market} 지수 급락 중 (당일 {-change_pct:.2f}% 하락, 음봉). 뇌동매매 방지를 위해 스캐너 작동을 차단합니다!"
+        if c < ma5:
+            return False, f"🚨 {market} 지수가 5일선 아래에 있습니다 (단기 하락 추세). 매매를 보류하고 관망하세요!"
+            
+        return True, f"✅ {market} 지수 안정권 (5일선 위 지지 확인, 스캔 가능)"
+    except Exception as e:
+        return True, "지수 데이터 확인 불가 (기본 매매 허용)"
 
-market_choice = st.sidebar.radio(
-    "스캔할 시장을 선택하세요:",
-    ["KOSDAQ 전종목 (추천)", "KOSPI 전종목"],
+# ==========================================
+# 3. 사이드바 설정
+# ==========================================
+st.sidebar.header("⚙️ 스캔 및 안전 설정")
+market_choice = st.sidebar.radio("스캔 시장:", ["KOSDAQ", "KOSPI"])
+
+use_kill_switch = st.sidebar.checkbox("🛡️ 시장 안전장치(Kill Switch) 켜기", value=True, help="지수가 꺾일 때 매매를 강제 차단하여 계좌를 지킵니다.")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("📰 당일 모멘텀 키워드 필터")
+keyword_input = st.sidebar.text_input(
+    "오늘의 주도 테마 (쉼표로 구분)", 
+    value="반도체, AI, 바이오, 2차전지, 수주, 공급계약, 자율주행"
 )
+keywords = [k.strip() for k in keyword_input.split(",") if k.strip()]
 
 # ==========================================
-# 3. 위험 종목 검증 (증100 / 신용불가)
+# 4. 종목 리스트 로드
 # ==========================================
-def get_stock_risk_info(code):
-    try:
-        url = f"https://finance.naver.com/item/main.naver?code={code}"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        res = requests.get(url, headers=headers, timeout=1.5)
-        if res.status_code == 200:
-            first_html = res.text[:12000]
-            if "증100" in first_html or "신용불가" in first_html:
-                return True
-    except Exception:
-        pass
-    return False
-
-# ==========================================
-# 4. 종목 리스트 로드 (캐싱 지원)
-# ==========================================
-@st.cache_data(ttl=3600)
-def load_selected_stocks(choice):
+@st.cache_data(ttl=1800)
+def load_selected_stocks(market):
     stocks = {}
-    market = "KOSDAQ" if "KOSDAQ" in choice else "KOSPI"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    
     try:
-        for page in range(1, 25):
+        # 상위 거래량 위주로 스캔
+        for page in range(1, 15): 
             url = f"https://finance.naver.com/api/sise/itemList.naver?marketType={market}&page={page}"
             res = requests.get(url, headers=headers, timeout=2)
             if res.status_code == 200:
-                data = res.json()
-                items = data.get("result", {}).get("itemList", [])
-                if not items:
-                    break
+                items = res.json().get("result", {}).get("itemList", [])
+                if not items: break
                 for item in items:
-                    name = item.get("itemname", "")
-                    code = item.get("itemcode", "")
+                    name, code = item.get("itemname", ""), item.get("itemcode", "")
                     if name and code:
-                        if not any(x in name for x in ["스팩", "우B", "우C", "ETF", "ETN", "리츠"]) and not name.endswith("우"):
+                        if not any(x in name for x in ["스팩", "우B", "우C", "ETF", "ETN", "리츠"]):
                             stocks[code] = name
-    except Exception:
-        pass
-
-    if not stocks:
-        try:
-            df_krx = fdr.StockListing('KRX')
-            filtered_df = df_krx[~df_krx['Name'].str.contains('스팩|우|ETF|ETN|REITs|리츠|관리|환기', na=False)]
-            stocks = dict(zip(filtered_df['Code'], filtered_df['Name']))
-        except Exception:
-            pass
-
+    except: pass
     return stocks
 
-TARGET_STOCKS = load_selected_stocks(market_choice)
-st.sidebar.metric("현재 분석 대상 종목 수", f"{len(TARGET_STOCKS):,} 개")
-
 # ==========================================
-# 5. 종목 정밀 분석 및 매수가/목표가/손절가 계산
+# 5. 스마트 분석 엔진 (뉴스 + 수급)
 # ==========================================
-def analyze_single_stock(item):
+def analyze_smart_stock(item, target_keywords):
     code, name = item
-    try:
-        url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count=250&requestType=0"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        res = requests.get(url, headers=headers, timeout=2)
+    
+    # 1. 키워드 필터링 (당일 호재/테마 판별)
+    has_momentum = False
+    if target_keywords:
+        try:
+            url = f"https://finance.naver.com/item/main.naver?code={code}"
+            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=1.5)
+            if res.status_code == 200:
+                html = res.text[:20000] # 네이버 금융 상단 주요 뉴스/섹터 영역 스캔
+                for kw in target_keywords:
+                    if kw in html or kw in name:
+                        has_momentum = True
+                        matched_kw = kw
+                        break
+        except: pass
+        
+        if not has_momentum: return None # 테마 키워드가 없으면 가차없이 탈락
+    else:
+        matched_kw = "키워드 미지정"
 
-        if res.status_code != 200 or "<item data=" not in res.text:
-            return None
+    # 2. 당일 실시간 수급 및 거래대금 검증
+    try:
+        url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count=10&requestType=0"
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=1.5)
+        if res.status_code != 200 or "<item data=" not in res.text: return None
 
         lines = res.text.split('<item data="')
         data_list = []
         for line in lines[1:]:
             raw = line.split('"')[0].split("|")
             if len(raw) >= 6:
-                data_list.append({
-                    "Date": raw[0], "Open": float(raw[1]), "High": float(raw[2]),
-                    "Low": float(raw[3]), "Close": float(raw[4]), "Volume": float(raw[5])
-                })
+                data_list.append({"Date": raw[0], "Close": float(raw[4]), "Volume": float(raw[5])})
 
         df = pd.DataFrame(data_list)
-        if len(df) < 60:
-            return None
-
-        latest = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        c, o, h, l = latest["Close"], latest["Open"], latest["High"], latest["Low"]
-        trading_value = c * latest["Volume"]
-
-        if c < 1000 or trading_value < 1000000000:
-            return None
-
-        body = abs(c - o)
-        upper_shadow = h - max(o, c)
-
-        if h > 0 and ((h - c) / h) * 100 >= 10.0:
-            return None
-
-        change = ((c - prev["Close"]) / prev["Close"]) * 100
-        vol_ratio = (latest["Volume"] / prev["Volume"]) * 100 if prev["Volume"] > 0 else 0
-
-        df["MA5"] = df["Close"].rolling(5).mean()
-        df["MA20"] = df["Close"].rolling(20).mean()
-        df["STD20"] = df["Close"].rolling(20).std()
-        df["UpperBB"] = df["MA20"] + (df["STD20"] * 2)
-
-        delta = df["Close"].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        loss = loss.replace(0, 0.00001)
-        rs = gain / loss
-        df["RSI"] = 100 - (100 / (1 + rs))
-
-        curr_rsi = df["RSI"].iloc[-1]
-        curr_upper_bb = df["UpperBB"].iloc[-1]
-
-        buy_price = int(c)
+        if len(df) < 3: return None
         
-        cb_target = int(buy_price * 1.045)
-        cb_stop = int(buy_price * 0.97)
-
-        day_target = int(buy_price * 1.035)
-        day_stop = int(buy_price * 0.975)
-
-        swing_target = int(buy_price * 1.075)
-        swing_stop = min(int(df["MA20"].iloc[-1]), int(buy_price * 0.96))
-
-        is_high_win_cb = (c >= curr_upper_bb * 0.97) and (vol_ratio >= 150) and (curr_rsi >= 48) and (c > o) and (change >= 2.0)
-        is_day_trade = (vol_ratio >= 120) and (c > prev["High"]) and (curr_rsi >= 45) and (change >= 2.0)
-        is_swing = (c > df["MA20"].iloc[-1]) and (vol_ratio >= 100) and (45 <= curr_rsi <= 68) and (change >= 0.5)
-
-        if is_high_win_cb or is_day_trade or is_swing:
-            if get_stock_risk_info(code):
-                return None
-
-            score = (vol_ratio * 0.3) + (change * 10) + ((70 - abs(60 - curr_rsi)) * 2)
-            if upper_shadow <= body * 0.2:
-                score += 15
-
-            acc_amount_eon = int(trading_value // 100000000)
-
-            res_dict = {
-                "종목명": name,
-                "종목코드": code,
-                "현재가/종가": f"{int(c):,}원",
-                "등락률": f"{change:+.2f}%",
-                "추천매수가": f"{buy_price:,}원",
-                "예상매도가": "",
-                "손절가": "",
-                "거래대금": f"{acc_amount_eon:,}억 원",
-                "RSI": f"{curr_rsi:.1f}",
-                "_score": score
-            }
-
-            if is_high_win_cb:
-                res_dict["예상매도가"] = f"{cb_target:,}원 (+4.5%)"
-                res_dict["손절가"] = f"{cb_stop:,}원 (-3.0%)"
-                return ("closing_bet", res_dict)
-            elif is_day_trade:
-                res_dict["예상매도가"] = f"{day_target:,}원 (+3.5%)"
-                res_dict["손절가"] = f"{day_stop:,}원 (-2.5%)"
-                return ("day_trade", res_dict)
-            elif is_swing:
-                res_dict["예상매도가"] = f"{swing_target:,}원 (+7.5%)"
-                res_dict["손절가"] = f"{swing_stop:,}원"
-                return ("swing", res_dict)
-
-    except Exception:
+        latest, prev = df.iloc[-1], df.iloc[-2]
+        c, p_c = latest["Close"], prev["Close"]
+        vol, p_vol = latest["Volume"], prev["Volume"]
+        trading_value = c * vol
+        
+        # 깐깐한 조건: 당일 거래대금 최소 70억 이상, 양봉, 거래량 전일비 150% 이상 폭발
+        if trading_value < 7000000000 or c <= p_c or vol < (p_vol * 1.5): 
+            return None
+            
+        change = ((c - p_c) / p_c) * 100
+        
+        return {
+            "종목명": name,
+            "종목코드": code,
+            "매칭 키워드": f"🔥 {matched_kw}",
+            "현재가": f"{int(c):,}원",
+            "당일 등락률": f"{change:+.2f}%",
+            "거래대금 (수급)": f"{int(trading_value//100000000):,}억 원",
+            "_value": trading_value
+        }
+    except:
         return None
-    return None
 
 # ==========================================
-# 6. 스캐너 메인 실행기 (병렬 처리)
+# 6. 메인 실행기 (UI)
 # ==========================================
-def run_scanner():
-    cb_list, day_list, swing_list = [], [], []
-
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(analyze_single_stock, item) for item in TARGET_STOCKS.items()]
-
-        for future in as_completed(futures):
-            try:
-                res = future.result()
-                if res:
-                    category, data = res
-                    if category == "closing_bet":
-                        cb_list.append(data)
-                    elif category == "day_trade":
-                        day_list.append(data)
-                    elif category == "swing":
-                        swing_list.append(data)
-            except Exception:
-                continue
-
-    def filter_top10(data_list):
-        if not data_list:
-            return pd.DataFrame()
-        df = pd.DataFrame(data_list)
-        df = df.sort_values(by="_score", ascending=False).head(10)
-        return df.drop(columns=["_score"], errors="ignore")
-
-    df_cb = filter_top10(cb_list)
-    df_day = filter_top10(day_list)
-    df_swing = filter_top10(swing_list)
-
-    return df_cb, df_day, df_swing
-
-# ==========================================
-# 7. 웹 UI 레이아웃 출력
-# ==========================================
-if st.button("🚀 매수가·목표가·손절가 포함 정밀 스캔 시작", type="primary"):
+if st.button("🚀 1단계: 스마트 모멘텀 스캔 (안전장치 가동)", type="primary"):
+    
+    # [핵심] 시장 지수가 무너졌는지 먼저 검사 (Kill Switch)
+    is_safe, market_msg = True, ""
+    if use_kill_switch:
+        is_safe, market_msg = check_market_trend(market_choice)
+        if not is_safe:
+            st.error(market_msg)
+            st.stop() # 지수가 위험하면 여기서 프로그램 강제 정지!
+        else:
+            st.success(market_msg)
+            
+    TARGET_STOCKS = load_selected_stocks(market_choice)
+    
     if not TARGET_STOCKS:
-        st.error("종목 목록을 불러오지 못했습니다.")
+        st.error("종목 데이터를 불러오지 못했습니다.")
     else:
-        with st.spinner("가격 전략 및 위험 종목 정밀 검증 중..."):
-            df_cb, df_day, df_swing = run_scanner()
-
-            st.subheader("🔥 [종가베팅 TOP 10] 볼린저상단 근접/돌파 종목")
-            if not df_cb.empty:
-                st.dataframe(df_cb, use_container_width=True)
+        with st.spinner("하락장 방어 필터 통과 완료. 당일 주도 테마 뉴스 및 실시간 수급을 스캔 중입니다..."):
+            results = []
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = [executor.submit(analyze_smart_stock, item, keywords) for item in TARGET_STOCKS.items()]
+                for future in as_completed(futures):
+                    res = future.result()
+                    if res: results.append(res)
+                    
+            if results:
+                # 거래대금이 가장 크게 터진 찐 주도주 상위 3개만 엄선
+                df = pd.DataFrame(results).sort_values(by="_value", ascending=False).head(3)
+                df = df.drop(columns=["_value"])
+                
+                st.subheader(f"🎯 당일 {market_choice} 핵심 주도주 TOP 3 (뉴스 모멘텀 + 수급 결합)")
+                st.dataframe(df, use_container_width=True)
+                st.info("💡 **매매 수칙**: 아무리 좋은 뉴스라도 -1.5% 이탈 시 미련 없이 손절 예약 주문을 걸어야 합니다!")
             else:
-                st.info("조건을 완벽히 부합하는 종가베팅 종목이 없습니다.")
-
-            st.divider()
-
-            st.subheader("⚡ [단타 TOP 10] 전일 고점 돌파 종목")
-            if not df_day.empty:
-                st.dataframe(df_day, use_container_width=True)
-            else:
-                st.info("조건을 만족하는 단타 종목이 없습니다.")
-
-            st.divider()
-
-            st.subheader("📈 [스윙 TOP 10] 20일선 위 정배열 종목")
-            if not df_swing.empty:
-                st.dataframe(df_swing, use_container_width=True)
-            else:
-                st.info("조건을 만족하는 스윙 종목이 없습니다.")
+                st.warning("현재 시장에 지정한 호재 키워드와 압도적 수급을 동반한 종목이 없습니다. 오늘은 무조건 매매를 쉬어가세요.")
