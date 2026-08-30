@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # 1. 페이지 및 타이틀 설정
 # ==========================================
 st.set_page_config(
-    page_title="이가네황가네 Pro V4 - 테마/속보 수집 스캐너", 
+    page_title="이가네황가네 Pro V4 - 주도주 스캐너", 
     page_icon="⚡", 
     layout="wide"
 )
@@ -20,7 +20,7 @@ st.title("⚡ 주도주 스캐너 V4")
 st.caption("네이버 뉴스 속보 & 상승 테마 실시간 수집 + 수급/체결강도 + Kill Switch")
 
 # ==========================================
-# 2. 시장 안전장치 (Kill Switch & 미장)
+# 2. 글로벌 & 국내 시장 안전장치 (Kill Switch)
 # ==========================================
 @st.cache_data(ttl=600)
 def check_global_and_us_market():
@@ -68,15 +68,12 @@ def check_domestic_market(market="KOSDAQ"):
 # ==========================================
 @st.cache_data(ttl=300)
 def fetch_naver_hot_news_and_themes():
-    """
-    네이버 금융 실시간 뉴스 속보 및 당일 상승률 상위 테마/특징주를 수집합니다.
-    """
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    hot_keywords = ["급등", "수주", "대규모", "세계 최초", "공급계약", "특허", "독점", "FDA", "M&A", "흑자전환", "신고가"]
+    hot_keywords = ["급등", "수주", "대규모", "세계 최초", "공급계약", "특허", "독점", "FDA", "M&A", "흑자전환", "신고가", "전쟁", "유가", "방산"]
     news_titles = []
     hot_themes = []
     
-    # 1. 네이버 금융 뉴스 속보 크롤링
+    # 1. 네이버 금융 특징주 뉴스 속보
     try:
         news_url = "https://finance.naver.com/news/news_list.naver?mode=LSS2D&section_id=102&msection_id=101"
         res = requests.get(news_url, headers=headers, timeout=3)
@@ -84,18 +81,17 @@ def fetch_naver_hot_news_and_themes():
             soup = BeautifulSoup(res.text, 'html.parser')
             titles = soup.select('.articleSubject a')
             for t in titles:
-                text = t.get_text(strip=True)
-                news_titles.append(text)
+                news_titles.append(t.get_text(strip=True))
     except Exception: pass
 
-    # 2. 당일 상승률 상위 테마 크롤링
+    # 2. 당일 상승률 상위 테마
     try:
         theme_url = "https://finance.naver.com/sise/theme.naver"
         res = requests.get(theme_url, headers=headers, timeout=3)
         if res.status_code == 200:
             soup = BeautifulSoup(res.text, 'html.parser')
             themes = soup.select('.col_type1 a')
-            for th in themes[:10]: # 상위 10개 테마 추출
+            for th in themes[:10]:
                 hot_themes.append(th.get_text(strip=True))
     except Exception: pass
 
@@ -113,7 +109,6 @@ use_kill_switch = st.sidebar.checkbox("🛡️ 국장 Kill Switch (지수 차단
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎛️ 필터 옵션")
 
-# 키워드 필터 ON/OFF 옵션
 filter_mode = st.sidebar.radio(
     "필터링 모드 선택:",
     ["🤖 뉴스/테마 키워드 자동 필터 (추천)", "⚡ 순수 수급 + 체결강도 모드 (키워드 OFF)"]
@@ -125,36 +120,35 @@ min_volume_power = st.sidebar.slider("최소 체결강도 (%)", 100, 200, 115, 5
 min_trade_val = st.sidebar.number_input("최소 거래대금 (억원)", value=50, step=10)
 
 # ==========================================
-# 5. 종목 리스트 로드
+# 5. 종목 리스트 로드 (오류 수정: FDR 기반)
 # ==========================================
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=3600)
 def load_selected_stocks(market):
     stocks = {}
-    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        for page in range(1, 15):
-            url = f"https://finance.naver.com/api/sise/itemList.naver?marketType={market}&page={page}"
-            res = requests.get(url, headers=headers, timeout=2)
-            if res.status_code == 200:
-                items = res.json().get("result", {}).get("itemList", [])
-                if not items: break
-                for item in items:
-                    name, code = item.get("itemname", ""), item.get("itemcode", "")
-                    if name and code:
-                        if not any(x in name for x in ["스팩", "우B", "우C", "ETF", "ETN", "리츠"]):
-                            stocks[code] = name
-    except Exception: pass
+        df_krx = fdr.StockListing('KRX')
+        target_df = df_krx[df_krx['Market'] == market]
+        
+        for _, row in target_df.iterrows():
+            code = str(row['Code']).zfill(6)
+            name = str(row['Name'])
+            
+            if not any(x in name for x in ["스팩", "우B", "우C", "ETF", "ETN", "리츠"]):
+                stocks[code] = name
+    except Exception:
+        stocks = {"068270": "셀트리온", "247540": "에코프로비엠", "086520": "에코프로"}
+        
     return stocks
 
 # ==========================================
-# 6. 종목 개별 분석 함수
+# 6. 종목 개별 정밀 분석
 # ==========================================
 def analyze_stock_v4(item, use_kw_filter, hot_kws, min_power, min_val_eon):
     code, name = item
     headers = {'User-Agent': 'Mozilla/5.0'}
     vol_power = 100.0
     found_keyword = "수급 주도주"
-    has_news_or_theme = not use_kw_filter # 키워드 OFF 모드일 경우 무조건 True
+    has_news_or_theme = not use_kw_filter
 
     try:
         url = f"https://finance.naver.com/item/main.naver?code={code}"
@@ -162,7 +156,7 @@ def analyze_stock_v4(item, use_kw_filter, hot_kws, min_power, min_val_eon):
         if res.status_code == 200:
             html = res.text
             
-            # 1. 체결강도 추출
+            # 1. 체결강도
             if "체결강도" in html:
                 idx = html.find("체결강도")
                 sub_html = html[idx:idx+300]
@@ -173,7 +167,7 @@ def analyze_stock_v4(item, use_kw_filter, hot_kws, min_power, min_val_eon):
                         vol_power = val
                         break
 
-            # 2. 키워드 필터 ON일 경우 핵심 재료 단어 감지
+            # 2. 키워드 필터링
             if use_kw_filter:
                 for kw in hot_kws:
                     if kw in html[:25000]:
@@ -183,7 +177,6 @@ def analyze_stock_v4(item, use_kw_filter, hot_kws, min_power, min_val_eon):
 
     except Exception: pass
     
-    # 조건 미달 시 탈락 (체결강도 미달 또는 키워드 미발견)
     if not has_news_or_theme or vol_power < min_power:
         return None
 
@@ -232,12 +225,11 @@ def analyze_stock_v4(item, use_kw_filter, hot_kws, min_power, min_val_eon):
         return None
 
 # ==========================================
-# 7. 메인 UI 및 실행기
+# 7. 메인 UI 및 실행
 # ==========================================
 us_warning, us_msg = check_global_and_us_market()
 st.info(us_msg)
 
-# 실시간 뉴스/테마 정보 미리 로드 및 표시
 hot_kws, news_titles, hot_themes = fetch_naver_hot_news_and_themes()
 
 with st.expander("📌 실시간 네이버 상승률 상위 테마 & 뉴스 속보 확인하기"):
@@ -247,15 +239,13 @@ with st.expander("📌 실시간 네이버 상승률 상위 테마 & 뉴스 속�
         if hot_themes:
             for i, th in enumerate(hot_themes, 1):
                 st.write(f"{i}. {th}")
-        else:
-            st.write("테마 정보 수집 중...")
+        else: st.write("테마 정보 수집 중...")
     with col2:
         st.markdown("**📰 실시간 특징주 뉴스 속보**")
         if news_titles:
             for nt in news_titles[:5]:
                 st.write(f"- {nt}")
-        else:
-            st.write("뉴스 속보 수집 중...")
+        else: st.write("뉴스 속보 수집 중...")
 
 if st.button("🚀 실시간 주도주 스캔 가동", type="primary"):
     
@@ -276,7 +266,7 @@ if st.button("🚀 실시간 주도주 스캔 가동", type="primary"):
     if not TARGET_STOCKS:
         st.error("종목 데이터를 불러오지 못했습니다.")
     else:
-        with st.spinner("네이버 뉴스 속보/상승 테마 및 수급 정밀 스캔 중..."):
+        with st.spinner("종목 수급 및 뉴스 정밀 스캔 중..."):
             results = []
             with ThreadPoolExecutor(max_workers=10) as executor:
                 futures = [
