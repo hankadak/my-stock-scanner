@@ -11,16 +11,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # 1. 페이지 및 타이틀 설정
 # ==========================================
 st.set_page_config(
-    page_title="이가네황가네 Pro V5 - 수익형 주도주 스캐너", 
+    page_title="이가네황가네 Pro V5.1 - 고성능 주도주 스캐너", 
     page_icon="⚡", 
     layout="wide"
 )
 
-st.title("⚡ 주도주 스캐너 V5 (수익 극대화 버전)")
-st.caption("실시간 수급 파워 + 유연한 하락장 대응 + 손익비 최적화 단타 시스템")
+st.title("⚡ 주도주 스캐너 V5.1")
+st.caption("실시간 체결강도 + 거래대금 수급 쏠림 + 완화된 포착 알고리즘")
 
 # ==========================================
-# 2. 글로벌 & 국내 시장 동향 체크 (경고형으로 유연화)
+# 2. 글로벌 & 국내 시장 동향 체크
 # ==========================================
 @st.cache_data(ttl=600)
 def check_global_and_us_market():
@@ -36,7 +36,7 @@ def check_global_and_us_market():
         
         if nasdaq_change <= -1.5 or sp500_change <= -1.5:
             us_warning = True
-            msg += " ⚠️ **미장 급락!** 매매 비중을 50% 축소하세요."
+            msg += " ⚠️ **미장 급락!** 매매 비중을 축소하세요."
             
         return us_warning, msg
     except Exception:
@@ -54,7 +54,7 @@ def check_domestic_market(market="KOSDAQ"):
         c, ma5 = latest["Close"], latest["MA5"]
         
         if c < ma5:
-            return False, f"⚠️ {market} 지수 하락 추세 (5일선 아래). **개별 수급주만 소액 진입 권장.**"
+            return False, f"⚠️ {market} 지수 하락 추세 (5일선 아래). **수급 집중주 위주 소액 진입 권장.**"
             
         return True, f"✅ {market} 지수 상승 추세 (안정적 매매 가능)"
     except Exception:
@@ -66,7 +66,7 @@ def check_domestic_market(market="KOSDAQ"):
 @st.cache_data(ttl=300)
 def fetch_naver_hot_news_and_themes():
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    hot_keywords = ["급등", "수주", "대규모", "세계최초", "공급계약", "특허", "독점", "FDA", "M&A", "흑자전환", "신고가", "전쟁", "유가", "방산", "AI", "반도체", "바이오"]
+    hot_keywords = ["급등", "수주", "대규모", "세계최초", "공급계약", "특허", "독점", "FDA", "M&A", "흑자전환", "신고가", "전쟁", "유가", "방산", "AI", "반도체", "바이오", "상승"]
     news_titles, hot_themes = [], []
     
     try:
@@ -90,7 +90,7 @@ def fetch_naver_hot_news_and_themes():
     return hot_keywords, news_titles, hot_themes
 
 # ==========================================
-# 4. 사이드바 설정 (수익 맞춤형 기본값 조정)
+# 4. 사이드바 설정 (포착 유연화)
 # ==========================================
 st.sidebar.header("⚙️ 스마트 수익 설정")
 market_choice = st.sidebar.radio("스캔 시장:", ["KOSDAQ", "KOSPI"])
@@ -100,14 +100,15 @@ st.sidebar.subheader("🎛️ 스캔 필터 조건")
 
 filter_mode = st.sidebar.radio(
     "필터링 모드:",
-    ["⚡ 순수 수급 + 체결강도 모드 (종목 포착 우선)", "🤖 뉴스/테마 키워드 조합 모드 (재료 우선)"]
+    ["⚡ 순수 수급 + 체결강도 모드 (추천: 종목 포착 극대화)", "🤖 뉴스/테마 키워드 조합 모드 (재료 우선)"],
+    index=0
 )
 
 use_keyword_filter = True if "뉴스/테마" in filter_mode else False
 
-# 기본값을 108%, 20억으로 완화하여 하락장/소강장 종목 포착력 대폭 향상
-min_volume_power = st.sidebar.slider("최소 체결강도 (%)", 100, 200, 108, 2)
-min_trade_val = st.sidebar.number_input("최소 거래대금 (억원)", value=20, step=5)
+# 포착력을 위해 체결강도 102%, 거래대금 10억까지 조정 가능하도록 설정
+min_volume_power = st.sidebar.slider("최소 체결강도 (%)", 90, 200, 103, 1)
+min_trade_val = st.sidebar.number_input("최소 거래대금 (억원)", value=10, step=5)
 
 # ==========================================
 # 5. 종목 리스트 로드 (FDR 기반)
@@ -129,9 +130,9 @@ def load_selected_stocks(market):
     return stocks
 
 # ==========================================
-# 6. 수익형 종목 정밀 정렬 알고리즘
+# 6. 유연해진 종목 분석 및 정렬
 # ==========================================
-def analyze_stock_v5(item, use_kw_filter, hot_kws, min_power, min_val_eon):
+def analyze_stock_v51(item, use_kw_filter, hot_kws, min_power, min_val_eon):
     code, name = item
     headers = {'User-Agent': 'Mozilla/5.0'}
     vol_power = 100.0
@@ -144,21 +145,21 @@ def analyze_stock_v5(item, use_kw_filter, hot_kws, min_power, min_val_eon):
         if res.status_code == 200:
             html = res.text
             
-            # 체결강도 추출
+            # 체결강도 정밀 추출
             if "체결강도" in html:
                 idx = html.find("체결강도")
-                sub_html = html[idx:idx+300]
+                sub_html = html[idx:idx+350]
                 numbers = re.findall(r'[\d\.]+', sub_html)
                 for num in numbers:
                     val = float(num)
-                    if 50.0 <= val <= 500.0:
+                    if 40.0 <= val <= 600.0:
                         vol_power = val
                         break
 
             # 키워드 검색
             if use_kw_filter:
                 for kw in hot_kws:
-                    if kw in html[:25000]:
+                    if kw in html[:30000]:
                         found_keyword = kw
                         has_news_or_theme = True
                         break
@@ -188,18 +189,18 @@ def analyze_stock_v5(item, use_kw_filter, hot_kws, min_power, min_val_eon):
         vol = latest["Volume"]
         trading_val_eon = int((c * vol) // 100000000)
         
-        # 주가 양봉 필수 조건 및 최소 거래대금
+        # 당일 양봉 조건 및 거래대금 기준
         if trading_val_eon < min_val_eon or c <= p_c: 
             return None
 
         change = ((c - p_c) / p_c) * 100
         buy_p = int(c)
-        stop_p = int(buy_p * 0.985)        # -1.5% 칼손절
-        target_p = int(buy_p * 1.03)       # +3% 1차 익절
+        stop_p = int(buy_p * 0.985)        # -1.5% 손절
+        target_p = int(buy_p * 1.03)       # +3% 익절
         target_p2 = int(buy_p * 1.05)      # +5% 2차 목표가
         
-        # 수익 매칭 스코어 산출 (체결강도 + 거래대금 가중치)
-        power_score = vol_power * 0.6 + (trading_val_eon * 0.4)
+        # 수급 스코어링
+        power_score = vol_power * 0.7 + (trading_val_eon * 0.3)
         
         return {
             "종목명": name,
@@ -251,7 +252,7 @@ if st.button("🚀 실시간 주도주 스캔 가동", type="primary"):
             results = []
             with ThreadPoolExecutor(max_workers=12) as executor:
                 futures = [
-                    executor.submit(analyze_stock_v5, item, use_keyword_filter, hot_kws, min_volume_power, min_trade_val) 
+                    executor.submit(analyze_stock_v51, item, use_keyword_filter, hot_kws, min_volume_power, min_trade_val) 
                     for item in TARGET_STOCKS.items()
                 ]
                 for future in as_completed(futures):
@@ -259,10 +260,10 @@ if st.button("🚀 실시간 주도주 스캔 가동", type="primary"):
                     if res: results.append(res)
                     
             if results:
-                df = pd.DataFrame(results).sort_values(by="_score", ascending=False).head(3)
+                df = pd.DataFrame(results).sort_values(by="_score", ascending=False).head(5)
                 df = df.drop(columns=["_score"])
-                st.subheader(f"🎯 당일 {market_choice} 수익 유력 주도주 (TOP 3)")
+                st.subheader(f"🎯 당일 {market_choice} 수급 주도주 (TOP 5)")
                 st.dataframe(df, use_container_width=True)
-                st.success("💡 **실전 매매 팁**: 진입 후 증증권사 앱에 `+3% 1차 익절`, `-1.5% 자동 감시 손절`을 즉시 세팅하세요!")
+                st.success("💡 **실전 매매 팁**: 진입 후 증권사 앱에 `+3% 1차 익절`, `-1.5% 자동 감시 손절`을 세팅하세요!")
             else:
-                st.warning("현재 기준(체결강도 및 거래대금)을 충족하는 종목이 없습니다. 조건값을 살짝 낮춰보세요.")
+                st.warning("현재 설정 기준을 만족하는 종목이 없습니다. 사이드바에서 거래대금이나 체결강도를 조금 낮춰보세요.")
