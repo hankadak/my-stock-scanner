@@ -12,13 +12,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # 1. 페이지 및 타이틀 설정
 # ==========================================
 st.set_page_config(
-    page_title="이가네황가네 Pro V6.3 - 시장분리형 주도주 분석기", 
+    page_title="이가네황가네 Pro V6.4 - 전체시장 통합 분석기", 
     page_icon="📈", 
     layout="wide"
 )
 
-st.title("📈 주도주 스캐너 V6.3 (시장 완벽 분리)")
-st.caption("KOSPI / KOSDAQ 완벽 분리 + 전일 마감 현황 + 당일 수급 파동 정밀 스캐너")
+st.title("📈 주도주 스캐너 V6.4 (전체 시장 통합 스캔)")
+st.caption("KOSPI + KOSDAQ 전체 종목 대상 + 전일 마감 수급 + 당일 파동 정밀 분석기")
 
 # ==========================================
 # 2. 시장 분석 (Top-Down 테마 수집)
@@ -62,9 +62,9 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. 차트 분석 엔진
+# 4. 차트 분석 엔진 (전일 + 당일 수급)
 # ==========================================
-def analyze_chart_v63(item, min_trade_val, strict_mode):
+def analyze_chart_v64(item, min_trade_val, strict_mode):
     code, name = item
     headers = {'User-Agent': 'Mozilla/5.0'}
     
@@ -104,6 +104,7 @@ def analyze_chart_v63(item, min_trade_val, strict_mode):
         trading_val_eon = int((c * vol) // 100000000)
         prev_trading_val_eon = int((p_c * p_vol) // 100000000)
         
+        # 조건: 당일 또는 전일 거래대금이 기준치 이상일 것
         if trading_val_eon < min_trade_val and prev_trading_val_eon < min_trade_val: 
             return None
         
@@ -146,7 +147,7 @@ def analyze_chart_v63(item, min_trade_val, strict_mode):
         return None
 
 # ==========================================
-# 5. 종목 리스트 로드 (코스피/코스닥 명확 구분)
+# 5. 종목 리스트 로드 (전체 시장 지원)
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_selected_stocks(market_type):
@@ -154,8 +155,9 @@ def load_selected_stocks(market_type):
     try:
         df_krx = fdr.StockListing('KRX')
         
-        # 시장 구분 정확히 필터링
-        if market_type == "KOSDAQ":
+        if market_type == "전체 시장 (KOSPI + KOSDAQ)":
+            target_df = df_krx[df_krx['Market'].str.contains('KOSPI|KOSDAQ', case=False, na=False)]
+        elif market_type == "KOSDAQ":
             target_df = df_krx[df_krx['Market'].str.contains('KOSDAQ', case=False, na=False)]
         else:
             target_df = df_krx[df_krx['Market'].str.contains('KOSPI', case=False, na=False)]
@@ -163,21 +165,25 @@ def load_selected_stocks(market_type):
         for _, row in target_df.iterrows():
             code = str(row['Code']).zfill(6)
             name = str(row['Name'])
-            if not any(x in name for x in ["스팩", "우B", "우C", "ETF", "ETN", "리츠"]):
+            # 불필요한 종목 제거 (스팩, 우선주, ETF, ETN, 리츠 등)
+            if not any(x in name for x in ["스팩", "우B", "우C", "ETF", "ETN", "리츠", "인버스", "레버리지"]):
                 stocks[code] = name
     except Exception:
-        # 비상시 시장별 예외 리스트 명확 분리
-        if market_type == "KOSDAQ":
-            stocks = {"247540": "에코프로비엠", "086520": "에코프로", "196170": "알테오젠", "293490": "카카오게임즈", "035900": "JYP Ent."}
-        else:
-            stocks = {"005930": "삼성전자", "000660": "SK하이닉스", "005380": "현대차", "068270": "셀트리온", "005935": "삼성전자우"}
+        stocks = {
+            "005930": "삼성전자", "000660": "SK하이닉스", "005380": "현대차", 
+            "068270": "셀트리온", "196170": "알테오젠", "247540": "에코프로비엠"
+        }
     return stocks
 
 # ==========================================
 # 6. 메인 UI
 # ==========================================
 st.sidebar.header("⚙️ 차트 스캔 설정")
-market_choice = st.sidebar.radio("분석 시장 선택:", ["KOSDAQ", "KOSPI"])
+market_choice = st.sidebar.radio(
+    "분석 시장 선택:", 
+    ["전체 시장 (KOSPI + KOSDAQ)", "KOSDAQ", "KOSPI"],
+    index=0
+)
 
 scan_mode = st.sidebar.radio(
     "스캔 모드 선택:",
@@ -198,14 +204,15 @@ else:
 
 st.markdown("---")
 
-if st.button(f"📈 {market_choice} 주도주 정밀 스캔 시작", type="primary"):
+if st.button(f"📈 {market_choice} 주도주 통합 스캔 시작", type="primary"):
     TARGET_STOCKS = load_selected_stocks(market_choice)
     
-    with st.spinner(f"{market_choice} 전일 마감 현황 및 당일 수급 정밀 분석 중..."):
+    with st.spinner(f"[{market_choice}] {len(TARGET_STOCKS):,}개 종목 전일 마감 현황 및 당일 수급 정밀 스캔 중..."):
         results = []
-        with ThreadPoolExecutor(max_workers=12) as executor:
+        # 전체 시장 종목 분석을 위해 스레드 수를 16개로 확대
+        with ThreadPoolExecutor(max_workers=16) as executor:
             futures = [
-                executor.submit(analyze_chart_v63, item, min_trade_val, strict_mode) 
+                executor.submit(analyze_chart_v64, item, min_trade_val, strict_mode) 
                 for item in TARGET_STOCKS.items()
             ]
             for future in as_completed(futures):
@@ -215,8 +222,8 @@ if st.button(f"📈 {market_choice} 주도주 정밀 스캔 시작", type="prima
         if results:
             df = pd.DataFrame(results).sort_values(by="_score", ascending=False).head(5)
             df = df.drop(columns=["_score"])
-            st.subheader(f"🎯 [{market_choice}] 당일 전일연속/수급 주도주 TOP 5")
+            st.subheader(f"🎯 [{market_choice}] 수급/차트 주도주 TOP 5")
             st.dataframe(df, use_container_width=True)
-            st.info("💡 **매매 안내**: 선택하신 시장의 종목들만 정밀 추출되었습니다. 1차 목표가(+3.5%) 도달 시 절반 익절하세요.")
+            st.info("💡 **매매 안내**: 전체 시장에서 거래대금과 차트 기술 지표가 가장 완벽히 결합된 TOP 5 종목입니다.")
         else:
-            st.warning(f"{market_choice} 시장에서 조건을 만족하는 종목이 없습니다. 거래대금 조건을 낮춰보세요.")
+            st.warning("조건을 만족하는 종목이 없습니다. 최소 거래대금을 낮추거나 모드를 변경해 보세요.")
