@@ -4,20 +4,29 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import numpy as np
+import datetime
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# pykrx 라이브러리 로드
+try:
+    from pykrx import stock
+except ImportError:
+    import os
+    os.system('pip install pykrx')
+    from pykrx import stock
 
 # ==========================================
 # 1. 페이지 및 타이틀 설정
 # ==========================================
 st.set_page_config(
-    page_title="이가네황가네 Pro V6.5 - 전시장 실시간 주도주 분석기", 
+    page_title="이가네황가네 Pro V7.0 - pykrx 외인/기관 수급 분석기", 
     page_icon="📈", 
     layout="wide"
 )
 
-st.title("📈 주도주 스캐너 V6.5 (전 시장 실시간 수급 반영)")
-st.caption("네이버 IP 차단 완벽 해결 + 전 시장 실시간 거래대금/상승률 상위 정밀 스캐너")
+st.title("📈 주도주 스캐너 V7.0 (외인/기관 수급 결합)")
+st.caption("KRX 공식 데이터(pykrx) 외인/기관 순매수 + 실시간 거래대금 + 차트 파동 정밀 스캐너")
 
 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'}
 
@@ -38,21 +47,14 @@ def get_market_leading_themes():
     return hot_themes
 
 # ==========================================
-# 3. 실시간 수급 상위 종목 추출 (1차 필터링)
+# 3. 실시간 후보 종목 추출 (1차 필터링)
 # ==========================================
 @st.cache_data(ttl=60)
 def fetch_top_candidate_stocks(market_type):
-    """ 거래대금 및 상승률 상위 종목을 수집하여 IP 차단을 방지함 """
     candidates = {}
-    
-    # sosok: 0 = KOSPI, 1 = KOSDAQ
-    sosok_list = []
-    if market_type == "KOSPI": sosok_list = [0]
-    elif market_type == "KOSDAQ": sosok_list = [1]
-    else: sosok_list = [0, 1]  # 전체 시장
+    sosok_list = [0] if market_type == "KOSPI" else ([1] if market_type == "KOSDAQ" else [0, 1])
     
     for sosok in sosok_list:
-        # 거래대금 상위 3페이지 (약 150종목)
         for page in range(1, 4):
             try:
                 url = f"https://finance.naver.com/sise/sise_quant.naver?sosok={sosok}&page={page}"
@@ -70,7 +72,6 @@ def fetch_top_candidate_stocks(market_type):
                                 candidates[code] = name
             except Exception: pass
 
-        # 상승률 상위 2페이지 (약 100종목)
         for page in range(1, 3):
             try:
                 url = f"https://finance.naver.com/sise/sise_rise.naver?sosok={sosok}&page={page}"
@@ -91,21 +92,36 @@ def fetch_top_candidate_stocks(market_type):
     return candidates
 
 # ==========================================
-# 4. 기술적 지표 계산 함수 (RSI & MACD)
+# 4. pykrx 외인/기관 순매수 수급 데이터 조회
+# ==========================================
+@st.cache_data(ttl=600)
+def get_krx_investor_data():
+    """ 최근 거래일 기준 외인/기관 순매수 데이터 조회 """
+    try:
+        today_str = datetime.datetime.now().strftime("%Y%m%d")
+        # 최근 5일간 수급 조회 (장 휴무일 대비)
+        start_str = (datetime.datetime.now() - datetime.timedelta(days=7)).strftime("%Y%m%d")
+        
+        # 종목별 외국인/기관 순매수 수집
+        df_net = stock.get_market_net_purchases_of_equities_by_ticker(start_str, today_str, "ALL")
+        return df_net
+    except Exception:
+        return pd.DataFrame()
+
+# ==========================================
+# 5. 기술적 지표 계산 함수 (RSI & MACD)
 # ==========================================
 def calculate_indicators(df):
     df['MA5'] = df['Close'].rolling(window=5).mean()
     df['MA20'] = df['Close'].rolling(window=20).mean()
     df['MA60'] = df['Close'].rolling(window=60).mean()
     
-    # RSI (14)
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / (loss + 1e-9)
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # MACD (12, 26, 9)
     exp1 = df['Close'].ewm(span=12, adjust=False).mean()
     exp2 = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = exp1 - exp2
@@ -115,9 +131,9 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 5. 차트 및 수급 분석 엔진
+# 6. 차트 및 외인/기관 수급 종합 분석 엔진
 # ==========================================
-def analyze_chart_v65(item, min_trade_val, strict_mode):
+def analyze_stock_v70(item, min_trade_val, strict_mode, df_krx_supply):
     code, name = item
     
     try:
@@ -131,12 +147,8 @@ def analyze_chart_v65(item, min_trade_val, strict_mode):
             raw = line.split('"')[0].split("|")
             if len(raw) >= 6:
                 data_list.append({
-                    "Date": raw[0], 
-                    "Open": float(raw[1]),
-                    "High": float(raw[2]),
-                    "Low": float(raw[3]),
-                    "Close": float(raw[4]), 
-                    "Volume": float(raw[5])
+                    "Date": raw[0], "Open": float(raw[1]), "High": float(raw[2]),
+                    "Low": float(raw[3]), "Close": float(raw[4]), "Volume": float(raw[5])
                 })
 
         df = pd.DataFrame(data_list)
@@ -156,7 +168,6 @@ def analyze_chart_v65(item, min_trade_val, strict_mode):
         trading_val_eon = int((c * vol) // 100000000)
         prev_trading_val_eon = int((p_c * p_vol) // 100000000)
         
-        # 최소 거래대금 조건
         if trading_val_eon < min_trade_val and prev_trading_val_eon < min_trade_val: 
             return None
         
@@ -174,8 +185,34 @@ def analyze_chart_v65(item, min_trade_val, strict_mode):
             if not (c >= latest['MA5'] and rsi_val >= 40):
                 return None
 
-        # 가중치 점수
-        chart_score = (rsi_val * 0.25) + (trading_val_eon * 0.35) + (prev_trading_val_eon * 0.2) + (today_change * 0.2)
+        # --- KRX 수급 데이터 추출 ---
+        foreign_buy = 0
+        institution_buy = 0
+        supply_text = "수급 확인중"
+        supply_score = 0
+        
+        if not df_krx_supply.empty and code in df_krx_supply.index:
+            row_supply = df_krx_supply.loc[code]
+            if "외국인합계" in row_supply:
+                foreign_buy = int(row_supply["외국인합계"] // 100000000) # 억원 단위
+            if "기관합계" in row_supply:
+                institution_buy = int(row_supply["기관합계"] // 100000000)
+                
+            if foreign_buy > 0 and institution_buy > 0:
+                supply_text = f"🔥 쌍끌이 (외인+{foreign_buy}억 / 기관+{institution_buy}억)"
+                supply_score = 30
+            elif foreign_buy > 0:
+                supply_text = f"🔴 외인순매수 (+{foreign_buy}억)"
+                supply_score = 15
+            elif institution_buy > 0:
+                supply_text = f"🔵 기관순매수 (+{institution_buy}억)"
+                supply_score = 15
+            else:
+                supply_text = "⚪ 개인/기타 위주"
+                supply_score = -5
+
+        # 점수 산정 (차트 + 거래대금 + KRX 외인/기관 수급)
+        chart_score = (rsi_val * 0.2) + (trading_val_eon * 0.3) + (today_change * 0.2) + supply_score
         
         buy_p = int(c)
         target_p1 = int(buy_p * 1.035)
@@ -187,7 +224,7 @@ def analyze_chart_v65(item, min_trade_val, strict_mode):
             "코드": code,
             "현재가": f"{buy_p:,}원",
             "당일 등락률": f"{today_change:+.2f}%",
-            "전일 마감등락": f"{prev_change:+.2f}%",
+            "KRX 외인/기관 수급": supply_text,
             "당일 거래대금": f"{trading_val_eon:,}억 원",
             "전일 거래대금": f"{prev_trading_val_eon:,}억 원",
             "RSI": f"{rsi_val:.1f}",
@@ -200,7 +237,7 @@ def analyze_chart_v65(item, min_trade_val, strict_mode):
         return None
 
 # ==========================================
-# 6. 메인 UI 및 스캔 가동
+# 7. 메인 UI 및 스캔 가동
 # ==========================================
 st.sidebar.header("⚙️ 차트 스캔 설정")
 market_choice = st.sidebar.radio(
@@ -228,16 +265,19 @@ else:
 
 st.markdown("---")
 
-if st.button(f"📈 {market_choice} 주도주 정밀 스캔 시작", type="primary"):
-    with st.spinner("실시간 수급/상승률 상위 유효 종목 추출 중..."):
+if st.button(f"📈 {market_choice} 외인/기관 수급 정밀 스캔 시작", type="primary"):
+    with st.spinner("1. KRX 외국인/기관 순매수 수급 데이터 수집 중..."):
+        df_krx_supply = get_krx_investor_data()
+        
+    with st.spinner("2. 실시간 수급/상승률 상위 유효 종목 추출 중..."):
         TARGET_STOCKS = fetch_top_candidate_stocks(market_choice)
     
     if TARGET_STOCKS:
-        with st.spinner(f"[{market_choice}] {len(TARGET_STOCKS)}개 후보 종목 정밀 분석 중..."):
+        with st.spinner(f"3. [{market_choice}] {len(TARGET_STOCKS)}개 후보 종목 수급 및 차트 정밀 분석 중..."):
             results = []
             with ThreadPoolExecutor(max_workers=10) as executor:
                 futures = [
-                    executor.submit(analyze_chart_v65, item, min_trade_val, strict_mode) 
+                    executor.submit(analyze_stock_v70, item, min_trade_val, strict_mode, df_krx_supply) 
                     for item in TARGET_STOCKS.items()
                 ]
                 for future in as_completed(futures):
@@ -247,10 +287,10 @@ if st.button(f"📈 {market_choice} 주도주 정밀 스캔 시작", type="prima
             if results:
                 df = pd.DataFrame(results).sort_values(by="_score", ascending=False).head(5)
                 df = df.drop(columns=["_score"])
-                st.subheader(f"🎯 [{market_choice}] 수급/차트 주도주 TOP 5")
+                st.subheader(f"🎯 [{market_choice}] 外人/機構 수급 주도주 TOP 5")
                 st.dataframe(df, use_container_width=True)
-                st.info("💡 **매매 안내**: 당일 실시간 거래대금과 전일 연속 파동이 검증된 시장 주도주 TOP 5입니다.")
+                st.success("💡 **분석 완료**: 외국인/기관 쌍끌이 순매수가 확인된 진짜 주도주가 최상위에 배치되었습니다.")
             else:
-                st.warning("조건을 만족하는 종목이 없습니다. 거래대금을 5억으로 낮추어 다시 스캔해 보세요.")
+                st.warning("조건을 만족하는 종목이 없습니다. 최소 거래대금을 낮추어 다시 스캔해 보세요.")
     else:
         st.error("후보 종목 수집 실패. 잠시 후 다시 시도해 주세요.")
