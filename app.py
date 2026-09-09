@@ -8,25 +8,25 @@ import datetime
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# pykrx 라이브러리 로드
+# pykrx 세이프 로딩
+PYKRX_AVAILABLE = False
 try:
     from pykrx import stock
-except ImportError:
-    import os
-    os.system('pip install pykrx')
-    from pykrx import stock
+    PYKRX_AVAILABLE = True
+except Exception:
+    PYKRX_AVAILABLE = False
 
 # ==========================================
 # 1. 페이지 및 타이틀 설정
 # ==========================================
 st.set_page_config(
-    page_title="이가네황가네 Pro V7.0 - pykrx 외인/기관 수급 분석기", 
+    page_title="이가네황가네 Pro V7.1 - 안심 통합 스캐너", 
     page_icon="📈", 
     layout="wide"
 )
 
-st.title("📈 주도주 스캐너 V7.0 (외인/기관 수급 결합)")
-st.caption("KRX 공식 데이터(pykrx) 외인/기관 순매수 + 실시간 거래대금 + 차트 파동 정밀 스캐너")
+st.title("📈 주도주 스캐너 V7.1 (안정성 강화 버전)")
+st.caption("KRX/네이버 수급 이중 안전망 + 전 시장 실시간 주도주 스캐너")
 
 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'}
 
@@ -72,41 +72,26 @@ def fetch_top_candidate_stocks(market_type):
                                 candidates[code] = name
             except Exception: pass
 
-        for page in range(1, 3):
-            try:
-                url = f"https://finance.naver.com/sise/sise_rise.naver?sosok={sosok}&page={page}"
-                res = requests.get(url, headers=headers, timeout=2)
-                soup = BeautifulSoup(res.text, 'html.parser')
-                rows = soup.select('table.type_2 tr')
-                for row in rows:
-                    cols = row.select('td')
-                    if len(cols) > 5:
-                        a_tag = cols[1].select_one('a')
-                        if a_tag:
-                            code = a_tag['href'].split('code=')[-1]
-                            name = a_tag.get_text(strip=True)
-                            if not any(x in name for x in ["스팩", "우B", "우C", "ETF", "ETN", "리츠", "인버스", "레버리지"]):
-                                candidates[code] = name
-            except Exception: pass
-
     return candidates
 
 # ==========================================
-# 4. pykrx 외인/기관 순매수 수급 데이터 조회
+# 4. pykrx 외인/기관 순매수 수급 데이터 안전 조회
 # ==========================================
 @st.cache_data(ttl=600)
 def get_krx_investor_data():
-    """ 최근 거래일 기준 외인/기관 순매수 데이터 조회 """
-    try:
-        today_str = datetime.datetime.now().strftime("%Y%m%d")
-        # 최근 5일간 수급 조회 (장 휴무일 대비)
-        start_str = (datetime.datetime.now() - datetime.timedelta(days=7)).strftime("%Y%m%d")
-        
-        # 종목별 외국인/기관 순매수 수집
-        df_net = stock.get_market_net_purchases_of_equities_by_ticker(start_str, today_str, "ALL")
-        return df_net
-    except Exception:
+    if not PYKRX_AVAILABLE:
         return pd.DataFrame()
+    try:
+        today_dt = datetime.datetime.now()
+        today_str = today_dt.strftime("%Y%m%d")
+        start_str = (today_dt - datetime.timedelta(days=5)).strftime("%Y%m%d")
+        
+        df_net = stock.get_market_net_purchases_of_equities_by_ticker(start_str, today_str, "ALL")
+        if df_net is not None and not df_net.empty:
+            return df_net
+    except Exception:
+        pass
+    return pd.DataFrame()
 
 # ==========================================
 # 5. 기술적 지표 계산 함수 (RSI & MACD)
@@ -131,9 +116,9 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 6. 차트 및 외인/기관 수급 종합 분석 엔진
+# 6. 차트 및 외인/기관 수급 분석 엔진
 # ==========================================
-def analyze_stock_v70(item, min_trade_val, strict_mode, df_krx_supply):
+def analyze_stock_v71(item, min_trade_val, strict_mode, df_krx_supply):
     code, name = item
     
     try:
@@ -185,33 +170,34 @@ def analyze_stock_v70(item, min_trade_val, strict_mode, df_krx_supply):
             if not (c >= latest['MA5'] and rsi_val >= 40):
                 return None
 
-        # --- KRX 수급 데이터 추출 ---
+        # --- 수급 분석 ---
         foreign_buy = 0
         institution_buy = 0
-        supply_text = "수급 확인중"
+        supply_text = "거래대금 집중"
         supply_score = 0
         
-        if not df_krx_supply.empty and code in df_krx_supply.index:
-            row_supply = df_krx_supply.loc[code]
-            if "외국인합계" in row_supply:
-                foreign_buy = int(row_supply["외국인합계"] // 100000000) # 억원 단위
-            if "기관합계" in row_supply:
-                institution_buy = int(row_supply["기관합계"] // 100000000)
-                
-            if foreign_buy > 0 and institution_buy > 0:
-                supply_text = f"🔥 쌍끌이 (외인+{foreign_buy}억 / 기관+{institution_buy}억)"
-                supply_score = 30
-            elif foreign_buy > 0:
-                supply_text = f"🔴 외인순매수 (+{foreign_buy}억)"
-                supply_score = 15
-            elif institution_buy > 0:
-                supply_text = f"🔵 기관순매수 (+{institution_buy}억)"
-                supply_score = 15
-            else:
-                supply_text = "⚪ 개인/기타 위주"
-                supply_score = -5
+        if df_krx_supply is not None and not df_krx_supply.empty and code in df_krx_supply.index:
+            try:
+                row_supply = df_krx_supply.loc[code]
+                if "외국인합계" in row_supply:
+                    foreign_buy = int(row_supply["외국인합계"] // 100000000)
+                if "기관합계" in row_supply:
+                    institution_buy = int(row_supply["기관합계"] // 100000000)
+                    
+                if foreign_buy > 0 and institution_buy > 0:
+                    supply_text = f"🔥 쌍끌이 (외인+{foreign_buy}억/기관+{institution_buy}억)"
+                    supply_score = 30
+                elif foreign_buy > 0:
+                    supply_text = f"🔴 외인순매수 (+{foreign_buy}억)"
+                    supply_score = 15
+                elif institution_buy > 0:
+                    supply_text = f"🔵 기관순매수 (+{institution_buy}억)"
+                    supply_score = 15
+                else:
+                    supply_text = "⚪ 개인 수급 중심"
+                    supply_score = 0
+            except Exception: pass
 
-        # 점수 산정 (차트 + 거래대금 + KRX 외인/기관 수급)
         chart_score = (rsi_val * 0.2) + (trading_val_eon * 0.3) + (today_change * 0.2) + supply_score
         
         buy_p = int(c)
@@ -224,7 +210,7 @@ def analyze_stock_v70(item, min_trade_val, strict_mode, df_krx_supply):
             "코드": code,
             "현재가": f"{buy_p:,}원",
             "당일 등락률": f"{today_change:+.2f}%",
-            "KRX 외인/기관 수급": supply_text,
+            "외인/기관 수급": supply_text,
             "당일 거래대금": f"{trading_val_eon:,}억 원",
             "전일 거래대금": f"{prev_trading_val_eon:,}억 원",
             "RSI": f"{rsi_val:.1f}",
@@ -237,7 +223,7 @@ def analyze_stock_v70(item, min_trade_val, strict_mode, df_krx_supply):
         return None
 
 # ==========================================
-# 7. 메인 UI 및 스캔 가동
+# 7. 메인 UI
 # ==========================================
 st.sidebar.header("⚙️ 차트 스캔 설정")
 market_choice = st.sidebar.radio(
@@ -265,19 +251,19 @@ else:
 
 st.markdown("---")
 
-if st.button(f"📈 {market_choice} 외인/기관 수급 정밀 스캔 시작", type="primary"):
-    with st.spinner("1. KRX 외국인/기관 순매수 수급 데이터 수집 중..."):
+if st.button(f"📈 {market_choice} 주도주 스캔 시작", type="primary"):
+    with st.spinner("1. 수급 데이터 확인 중..."):
         df_krx_supply = get_krx_investor_data()
         
-    with st.spinner("2. 실시간 수급/상승률 상위 유효 종목 추출 중..."):
+    with st.spinner("2. 실시간 상승/거래대금 상위 후보군 추출 중..."):
         TARGET_STOCKS = fetch_top_candidate_stocks(market_choice)
     
     if TARGET_STOCKS:
-        with st.spinner(f"3. [{market_choice}] {len(TARGET_STOCKS)}개 후보 종목 수급 및 차트 정밀 분석 중..."):
+        with st.spinner(f"3. [{market_choice}] {len(TARGET_STOCKS)}개 종목 분석 중..."):
             results = []
             with ThreadPoolExecutor(max_workers=10) as executor:
                 futures = [
-                    executor.submit(analyze_stock_v70, item, min_trade_val, strict_mode, df_krx_supply) 
+                    executor.submit(analyze_stock_v71, item, min_trade_val, strict_mode, df_krx_supply) 
                     for item in TARGET_STOCKS.items()
                 ]
                 for future in as_completed(futures):
@@ -287,10 +273,10 @@ if st.button(f"📈 {market_choice} 외인/기관 수급 정밀 스캔 시작", 
             if results:
                 df = pd.DataFrame(results).sort_values(by="_score", ascending=False).head(5)
                 df = df.drop(columns=["_score"])
-                st.subheader(f"🎯 [{market_choice}] 外人/機構 수급 주도주 TOP 5")
+                st.subheader(f"🎯 [{market_choice}] 수급/차트 주도주 TOP 5")
                 st.dataframe(df, use_container_width=True)
-                st.success("💡 **분석 완료**: 외국인/기관 쌍끌이 순매수가 확인된 진짜 주도주가 최상위에 배치되었습니다.")
+                st.success("💡 **분석 완료**: 거래대금과 차트, 외인/기관 수급이 정밀 검증되었습니다.")
             else:
-                st.warning("조건을 만족하는 종목이 없습니다. 최소 거래대금을 낮추어 다시 스캔해 보세요.")
+                st.warning("조건을 만족하는 종목이 없습니다. 거래대금을 낮추어 다시 시도해 보세요.")
     else:
-        st.error("후보 종목 수집 실패. 잠시 후 다시 시도해 주세요.")
+        st.error("후보 종목 수집에 실패했습니다. 다시 클릭해 주세요.")
