@@ -9,13 +9,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # 1. 페이지 및 기본 설정
 # ==========================================
 st.set_page_config(
-    page_title="주도주 스캐너 Pro V9.5", 
+    page_title="주도주 스캐너 Pro V9.8", 
     page_icon="📈", 
     layout="wide"
 )
 
-st.title("📈 주도주 스캐너 V9.5 (네이버 테마 자동 연동 + 미장 풀스캔)")
-st.caption("중소형주 자동 포착: 네이버 금융 테마 그룹 실시간 매핑 & 미장 모멘텀 통합 분석")
+st.title("📈 주도주 스캐너 V9.8 (중소형 테마/부품주 완벽 포착)")
+st.caption("대형주 독점 방지: 수급 폭발도 + 네이버 테마 전체 자동 매핑 + 미장 모멘텀 스캐너")
 
 headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -63,11 +63,10 @@ def fetch_global_market_status():
     return us_data
 
 # ==========================================
-# 3. 네이버 테마별 구성 종목 실시간 크롤링 (핵심 고도화)
+# 3. 네이버 테마별 전체 종목 크롤링
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_naver_theme_stocks():
-    # 네이버 테마 카테고리 URL 코드 매핑
     theme_urls = {
         "원자력": "https://finance.naver.com/sise/sise_group_detail.naver?type=theme&no=361",
         "방산": "https://finance.naver.com/sise/sise_group_detail.naver?type=theme&no=258",
@@ -77,8 +76,7 @@ def fetch_naver_theme_stocks():
         "2차전지": "https://finance.naver.com/sise/sise_group_detail.naver?type=theme&no=319"
     }
     
-    theme_map = {} # {"종목코드": ["원자력", "방산"]}
-    
+    theme_map = {}
     for theme_name, url in theme_urls.items():
         try:
             res = requests.get(url, headers=headers, timeout=2)
@@ -136,9 +134,9 @@ def check_stock_news(code):
         return "뉴스 분석 실패", 0
 
 # ==========================================
-# 6. 테마 자동 매핑 + 모멘텀 엔진 (V9.5)
+# 6. 종목 분석 및 수급 폭발도 엔진 (V9.8)
 # ==========================================
-def analyze_stock_v95(item, min_trade_val, us_status, theme_map):
+def analyze_stock_v98(item, min_trade_val, us_status, theme_map):
     code, name = item
     try:
         url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count=60&requestType=0"
@@ -156,9 +154,10 @@ def analyze_stock_v95(item, min_trade_val, us_status, theme_map):
         if len(df) < 20: return None
         
         latest, prev = df.iloc[-1], df.iloc[-2]
-        c, p_c, vol = latest["Close"], prev["Close"], latest["Volume"]
+        c, p_c, vol, p_vol = latest["Close"], prev["Close"], latest["Volume"], prev["Volume"]
         trading_val_eon = int((c * vol) // 100000000)
         
+        # 최소 거래대금 필터링 (기본값 10억 이상)
         if trading_val_eon < min_trade_val: return None
             
         df['MA5'] = df['Close'].rolling(window=5).mean()
@@ -173,42 +172,43 @@ def analyze_stock_v95(item, min_trade_val, us_status, theme_map):
         today_change = ((c - p_c) / p_c) * 100
         rsi_val = df.iloc[-1]['RSI'] if not np.isnan(df.iloc[-1]['RSI']) else 50
         
+        # 수급 폭발도 계산 (전일 대비 거래량 비율 %)
+        vol_ratio = (vol / (p_vol + 1e-9)) * 100
+        
         news_tag, news_score = check_stock_news(code)
         
         # ------------------------------------------
-        # 자동 테마 매핑 기반 가산점 로직
+        # 테마 가산점
         # ------------------------------------------
         us_bonus = 0.0
         applied_theme = []
-        stock_themes = theme_map.get(code, []) # 해당 종목이 속한 네이버 테마 목록
+        stock_themes = theme_map.get(code, [])
 
-        # 1) 원자력 (카메코 상승 시)
         if us_status.get("카메코", 0) > 1.5 and "원자력" in stock_themes:
-            us_bonus += 25.0; applied_theme.append("원자력/SMR")
+            us_bonus += 30.0; applied_theme.append("원자력/SMR")
 
-        # 2) 해양방산/잠수함 (제너럴다이나믹스 상승 시)
         if us_status.get("제너럴다이나믹스", 0) > 1.5 and "조선" in stock_themes:
-            us_bonus += 25.0; applied_theme.append("해양방산")
+            us_bonus += 30.0; applied_theme.append("해양방산")
 
-        # 3) 중동전쟁/방산 (록히드마틴 상승 시)
         if us_status.get("록히드마틴", 0) > 1.5 and "방산" in stock_themes:
-            us_bonus += 25.0; applied_theme.append("방산")
+            us_bonus += 30.0; applied_theme.append("방산")
 
-        # 4) 석유/유가 (엑손모빌 상승 시)
         if us_status.get("엑손모빌", 0) > 1.5 and "석유" in stock_themes:
-            us_bonus += 20.0; applied_theme.append("석유/유가")
+            us_bonus += 25.0; applied_theme.append("석유/유가")
 
-        # 5) 반도체 (엔비디아 상승 시)
         if us_status.get("엔비디아", 0) > 1.5 and "반도체" in stock_themes:
-            us_bonus += 15.0; applied_theme.append("반도체")
+            us_bonus += 20.0; applied_theme.append("반도체")
 
-        # 6) 2차전지 (테슬라 상승 시)
         if us_status.get("테슬라", 0) > 1.5 and "2차전지" in stock_themes:
-            us_bonus += 15.0; applied_theme.append("2차전지")
+            us_bonus += 20.0; applied_theme.append("2차전지")
 
-        theme_tag = f"🌐 테마자동수혜({', '.join(applied_theme)})" if applied_theme else "일반"
+        theme_tag = f"🌐 테마수혜({', '.join(applied_theme)})" if applied_theme else "일반"
 
-        score = (trading_val_eon * 0.4) + (today_change * 0.2) + (rsi_val * 0.1) + news_score + us_bonus
+        # ------------------------------------------
+        # 개편된 점수 산정 공식 (중소형 주도주 우선 정렬)
+        # ------------------------------------------
+        # 거래대금의 절대 금액 비중을 대폭 줄이고, 당일 등락률과 거래량 급증률(수급 폭발도)에 가중치 부여
+        score = (today_change * 3.5) + (min(vol_ratio, 500) * 0.1) + (trading_val_eon * 0.02) + (rsi_val * 0.05) + news_score + us_bonus
         
         buy_p = int(c)
         return {
@@ -217,6 +217,7 @@ def analyze_stock_v95(item, min_trade_val, us_status, theme_map):
             "현재가": f"{buy_p:,}원",
             "당일 등락률": f"{today_change:+.2f}%",
             "당일 거래대금": f"{trading_val_eon:,}억 원",
+            "전일대비 거래량": f"{vol_ratio:.0f}%",
             "자동 감지 테마": theme_tag,
             "뉴스/호재 상태": news_tag,
             "1차 목표(+3.5%)": f"{int(buy_p * 1.035):,}원",
@@ -230,7 +231,7 @@ def analyze_stock_v95(item, min_trade_val, us_status, theme_map):
 # 7. 메인 UI 구성
 # ==========================================
 st.sidebar.header("⚙️ 스캔 설정")
-min_trade_val = st.sidebar.number_input("최소 거래대금 (억원)", value=30, step=10)
+min_trade_val = st.sidebar.number_input("최소 거래대금 (억원)", value=10, step=5)
 
 us_status = fetch_global_market_status()
 
@@ -244,14 +245,14 @@ col5.metric("엔비디아 (반도체)", f"{us_status.get('엔비디아', 0):+.2f
 
 st.markdown("---")
 
-if st.button("🚀 자동 테마매핑 주도주 스캔 시작", type="primary"):
-    with st.spinner("네이버 테마 데이터 수집 + 미장 모멘텀 매핑 분석 중..."):
+if st.button("🚀 중소형 주도주 스캔 시작", type="primary"):
+    with st.spinner("KRX 전 종목 수급 폭발도 + 네이버 테마 자동 매핑 분석 중..."):
         TARGET_STOCKS = fetch_all_krx_stocks()
         THEME_MAP = fetch_naver_theme_stocks()
         
         results = []
         with ThreadPoolExecutor(max_workers=12) as executor:
-            futures = [executor.submit(analyze_stock_v95, item, min_trade_val, us_status, THEME_MAP) for item in TARGET_STOCKS.items()]
+            futures = [executor.submit(analyze_stock_v98, item, min_trade_val, us_status, THEME_MAP) for item in TARGET_STOCKS.items()]
             for future in as_completed(futures):
                 res = future.result()
                 if res: results.append(res)
@@ -259,8 +260,8 @@ if st.button("🚀 자동 테마매핑 주도주 스캔 시작", type="primary")
         if results:
             df = pd.DataFrame(results).sort_values(by="_score", ascending=False).head(5)
             df = df.drop(columns=["_score"])
-            st.subheader("🎯 자동 테마 매핑 최상위 주도주 TOP 5")
+            st.subheader("🎯 당일 최상위 중소형 주도주 / 테마주 TOP 5")
             st.dataframe(df, use_container_width=True)
-            st.success("💡 스캔 완료: 네이버 테마 그룹에 편입된 모든 중소형주가 자동으로 파악되었습니다.")
+            st.success("💡 스캔 완료: 대형주 착시 현상이 제거되고 당일 강한 수급이 들어오는 테마주/부품주가 포착되었습니다.")
         else:
-            st.warning("조건을 만족하는 종목이 없습니다. 거래대금 설정을 조율해보세요.")
+            st.warning("조건을 만족하는 종목이 없습니다. 최소 거래대금을 조율해보세요.")
