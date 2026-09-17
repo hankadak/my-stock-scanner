@@ -9,13 +9,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # 1. 페이지 및 기본 설정
 # ==========================================
 st.set_page_config(
-    page_title="주도주 스캐너 Pro V9.8", 
-    page_icon="📈", 
+    page_title="애프터마켓 오버나이트 스캐너 V11.0", 
+    page_icon="🌙", 
     layout="wide"
 )
 
-st.title("📈 주도주 스캐너 V9.8 (중소형 테마/부품주 완벽 포착)")
-st.caption("대형주 독점 방지: 수급 폭발도 + 네이버 테마 전체 자동 매핑 + 미장 모멘텀 스캐너")
+st.title("🌙 애프터마켓 오버나이트 스캐너 V11.0 (19:30 타겟팅)")
+st.caption("19:30 매수 ➔ 익일 아침 매도: 당일 종가 모멘텀 + 시간외 수급 + 미장 연동성 종합 분석")
 
 headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -63,7 +63,7 @@ def fetch_global_market_status():
     return us_data
 
 # ==========================================
-# 3. 네이버 테마별 전체 종목 크롤링
+# 3. 네이버 테마별 전체 종목 실시간 크롤링
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_naver_theme_stocks():
@@ -129,100 +129,69 @@ def check_stock_news(code):
         
         if found:
             return f"🔥 호재({', '.join(found)})", len(found) * 15.0
-        return "일반 뉴스/특이사항 없음", 0
+        return "특이사항 없음", 0
     except Exception:
         return "뉴스 분석 실패", 0
 
 # ==========================================
-# 6. 종목 분석 및 수급 폭발도 엔진 (V9.8)
+# 6. 오버나이트 전용 스캔 엔진 (V11.0)
 # ==========================================
-def analyze_stock_v98(item, min_trade_val, us_status, theme_map):
+def analyze_overnight_stock(item, min_trade_val, us_status, theme_map):
     code, name = item
     try:
-        url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count=60&requestType=0"
+        url = f"https://polling.finance.naver.com/api/realtime/mkt/domestic/stocks/{code}"
         res = requests.get(url, headers=headers, timeout=1.5)
-        if res.status_code != 200 or "<item data=" not in res.text: return None
+        if res.status_code != 200: return None
 
-        lines = res.text.split('<item data="')
-        data_list = []
-        for line in lines[1:]:
-            raw = line.split('"')[0].split("|")
-            if len(raw) >= 6:
-                data_list.append({"Close": float(raw[4]), "Volume": float(raw[5])})
+        data = res.json()
+        stock_data = data.get('datas', [])[0]
+        
+        c = float(stock_data.get('closePrice', 0))
+        today_change = float(stock_data.get('fluctuationsRatio', 0)) # 당일 등락률
+        accumulated_trading_value = float(stock_data.get('accumulatedTradingValue', 0))
+        trading_val_eon = int(accumulated_trading_value // 100000000)
+        
+        # 1) 거래대금 및 최소 상승률 조건 (당일 최소 +3% 이상 유지 종목만 오버나이트 타겟)
+        if trading_val_eon < min_trade_val or today_change < 3.0: 
+            return None
 
-        df = pd.DataFrame(data_list)
-        if len(df) < 20: return None
-        
-        latest, prev = df.iloc[-1], df.iloc[-2]
-        c, p_c, vol, p_vol = latest["Close"], prev["Close"], latest["Volume"], prev["Volume"]
-        trading_val_eon = int((c * vol) // 100000000)
-        
-        # 최소 거래대금 필터링 (기본값 10억 이상)
-        if trading_val_eon < min_trade_val: return None
-            
-        df['MA5'] = df['Close'].rolling(window=5).mean()
-        if c < df.iloc[-1]['MA5']: return None
-            
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / (loss + 1e-9)
-        df['RSI'] = 100 - (100 / (1 + rs))
-        
-        today_change = ((c - p_c) / p_c) * 100
-        rsi_val = df.iloc[-1]['RSI'] if not np.isnan(df.iloc[-1]['RSI']) else 50
-        
-        # 수급 폭발도 계산 (전일 대비 거래량 비율 %)
-        vol_ratio = (vol / (p_vol + 1e-9)) * 100
-        
+        # 2) 상한가(+30%) 진입 종목은 이미 매수가 불가능하므로 제외 (+28% 이하로 필터링)
+        if today_change >= 29.5:
+            return None
+
         news_tag, news_score = check_stock_news(code)
         
-        # ------------------------------------------
-        # 테마 가산점
-        # ------------------------------------------
+        # 테마 연동 및 미장 가산점
         us_bonus = 0.0
         applied_theme = []
         stock_themes = theme_map.get(code, [])
 
-        if us_status.get("카메코", 0) > 1.5 and "원자력" in stock_themes:
-            us_bonus += 30.0; applied_theme.append("원자력/SMR")
+        if us_status.get("카메코", 0) > 1.0 and "원자력" in stock_themes:
+            us_bonus += 35.0; applied_theme.append("원자력/SMR")
+        if us_status.get("록히드마틴", 0) > 1.0 and "방산" in stock_themes:
+            us_bonus += 35.0; applied_theme.append("방산")
+        if us_status.get("엑손모빌", 0) > 1.0 and "석유" in stock_themes:
+            us_bonus += 30.0; applied_theme.append("석유/유가")
+        if us_status.get("엔비디아", 0) > 1.0 and "반도체" in stock_themes:
+            us_bonus += 25.0; applied_theme.append("반도체")
 
-        if us_status.get("제너럴다이나믹스", 0) > 1.5 and "조선" in stock_themes:
-            us_bonus += 30.0; applied_theme.append("해양방산")
+        theme_tag = f"🌐 {', '.join(applied_theme)}" if applied_theme else "일반 주도주"
 
-        if us_status.get("록히드마틴", 0) > 1.5 and "방산" in stock_themes:
-            us_bonus += 30.0; applied_theme.append("방산")
-
-        if us_status.get("엑손모빌", 0) > 1.5 and "석유" in stock_themes:
-            us_bonus += 25.0; applied_theme.append("석유/유가")
-
-        if us_status.get("엔비디아", 0) > 1.5 and "반도체" in stock_themes:
-            us_bonus += 20.0; applied_theme.append("반도체")
-
-        if us_status.get("테슬라", 0) > 1.5 and "2차전지" in stock_themes:
-            us_bonus += 20.0; applied_theme.append("2차전지")
-
-        theme_tag = f"🌐 테마수혜({', '.join(applied_theme)})" if applied_theme else "일반"
-
-        # ------------------------------------------
-        # 개편된 점수 산정 공식 (중소형 주도주 우선 정렬)
-        # ------------------------------------------
-        # 거래대금의 절대 금액 비중을 대폭 줄이고, 당일 등락률과 거래량 급증률(수급 폭발도)에 가중치 부여
-        score = (today_change * 3.5) + (min(vol_ratio, 500) * 0.1) + (trading_val_eon * 0.02) + (rsi_val * 0.05) + news_score + us_bonus
+        # 오버나이트 점수 산정: 당일 상승 모멘텀(50%) + 뉴스(25%) + 미장 유입 가산점(25%)
+        overnight_score = (today_change * 5.0) + news_score + us_bonus + (trading_val_eon * 0.01)
         
         buy_p = int(c)
         return {
             "종목명": name,
             "코드": code,
-            "현재가": f"{buy_p:,}원",
-            "당일 등락률": f"{today_change:+.2f}%",
+            "애프터마켓 현재가": f"{buy_p:,}원",
+            "당일 상승률": f"{today_change:+.2f}%",
             "당일 거래대금": f"{trading_val_eon:,}억 원",
-            "전일대비 거래량": f"{vol_ratio:.0f}%",
-            "자동 감지 테마": theme_tag,
-            "뉴스/호재 상태": news_tag,
-            "1차 목표(+3.5%)": f"{int(buy_p * 1.035):,}원",
-            "손절가(-2.0%)": f"{int(buy_p * 0.980):,}원",
-            "_score": score
+            "테마 연동": theme_tag,
+            "뉴스 상태": news_tag,
+            "익일 아침 목표가(+2.5%)": f"{int(buy_p * 1.025):,}원",
+            "오버나이트 손절가(-1.5%)": f"{int(buy_p * 0.985):,}원",
+            "_score": overnight_score
         }
     except Exception:
         return None
@@ -235,24 +204,24 @@ min_trade_val = st.sidebar.number_input("최소 거래대금 (억원)", value=10
 
 us_status = fetch_global_market_status()
 
-st.subheader("🚨 지정학 리스크 & 글로벌 증시 현황")
+st.subheader("🌐 미장 프리마켓 & 지정학 리스크 동향")
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("록히드마틴 (방산)", f"{us_status.get('록히드마틴', 0):+.2f}%")
 col2.metric("제너럴다이나믹스 (잠수함)", f"{us_status.get('제너럴다이나믹스', 0):+.2f}%")
-col3.metric("카메코 (원자력/우라늄)", f"{us_status.get('카메코', 0):+.2f}%")
+col3.metric("카메코 (원자력/SMR)", f"{us_status.get('카메코', 0):+.2f}%")
 col4.metric("엑손모빌 (석유)", f"{us_status.get('엑손모빌', 0):+.2f}%")
 col5.metric("엔비디아 (반도체)", f"{us_status.get('엔비디아', 0):+.2f}%")
 
 st.markdown("---")
 
-if st.button("🚀 중소형 주도주 스캔 시작", type="primary"):
-    with st.spinner("KRX 전 종목 수급 폭발도 + 네이버 테마 자동 매핑 분석 중..."):
+if st.button("🌙 19:30 오버나이트 종목 스캔", type="primary"):
+    with st.spinner("애프터마켓 수급 분석 및 익일 갭상승 종목 선별 중..."):
         TARGET_STOCKS = fetch_all_krx_stocks()
         THEME_MAP = fetch_naver_theme_stocks()
         
         results = []
-        with ThreadPoolExecutor(max_workers=12) as executor:
-            futures = [executor.submit(analyze_stock_v98, item, min_trade_val, us_status, THEME_MAP) for item in TARGET_STOCKS.items()]
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            futures = [executor.submit(analyze_overnight_stock, item, min_trade_val, us_status, THEME_MAP) for item in TARGET_STOCKS.items()]
             for future in as_completed(futures):
                 res = future.result()
                 if res: results.append(res)
@@ -260,8 +229,8 @@ if st.button("🚀 중소형 주도주 스캔 시작", type="primary"):
         if results:
             df = pd.DataFrame(results).sort_values(by="_score", ascending=False).head(5)
             df = df.drop(columns=["_score"])
-            st.subheader("🎯 당일 최상위 중소형 주도주 / 테마주 TOP 5")
+            st.subheader("🎯 익일 시초가 갭상승 유력 TOP 5 (19:30 매수 추천)")
             st.dataframe(df, use_container_width=True)
-            st.success("💡 스캔 완료: 대형주 착시 현상이 제거되고 당일 강한 수급이 들어오는 테마주/부품주가 포착되었습니다.")
+            st.info("💡 전략 안내: 저녁 19:30~19:50 사이 애프터마켓 매수 ➔ 다음 날 아침 프리마켓(08:00) 또는 정규장 시초가(09:00~09:10) 매도")
         else:
-            st.warning("조건을 만족하는 종목이 없습니다. 최소 거래대금을 조율해보세요.")
+            st.warning("오버나이트 조건(당일 상승률 +3% 이상, 거래대금 만족)에 맞는 종목이 없습니다.")
