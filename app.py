@@ -9,42 +9,46 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # 1. 페이지 설정
 # ==========================================
 st.set_page_config(
-    page_title="주도주 스캐너 Pro V7.3", 
+    page_title="주도주 스캐너 Pro V7.4", 
     page_icon="📈", 
     layout="wide"
 )
 
-st.title("📈 주도주 스캐너 V7.3 (초안정화 버전)")
-st.caption("외부 라이브러리 의존성 0% + 안심 차트/수급 스캐너")
+st.title("📈 주도주 스캐너 V7.4")
+st.caption("수급/차트 안심 스캐너 (네이버 금융 호환성 강화)")
 
+# 네이버 차단 방지용 브라우저 헤더 설정
 headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Referer': 'https://finance.naver.com/'
 }
 
 # ==========================================
-# 2. 실시간 후보 종목 추출 (1차 필터링)
+# 2. 실시간 후보 종목 추출 (보완된 파싱)
 # ==========================================
 @st.cache_data(ttl=60)
 def fetch_top_candidate_stocks(market_type):
     candidates = {}
     sosok_list = [0] if market_type == "KOSPI" else ([1] if market_type == "KOSDAQ" else [0, 1])
     
+    session = requests.Session()
+    session.headers.update(headers)
+    
     for sosok in sosok_list:
-        # 거래대금 상위 2페이지
-        for page in range(1, 3):
+        # 거래량/거래대금 상위 3페이지 탐색
+        for page in range(1, 4):
             try:
                 url = f"https://finance.naver.com/sise/sise_quant.naver?sosok={sosok}&page={page}"
-                res = requests.get(url, headers=headers, timeout=3)
+                res = session.get(url, timeout=5)
                 if res.status_code == 200:
-                    soup = BeautifulSoup(res.text, 'html.parser')
-                    rows = soup.select('table.type_2 tr')
-                    for row in rows:
-                        cols = row.select('td')
-                        if len(cols) > 5:
-                            a_tag = cols[1].select_one('a')
-                            if a_tag:
-                                code = a_tag['href'].split('code=')[-1]
-                                name = a_tag.get_text(strip=True)
+                    soup = BeautifulSoup(res.content.decode('euc-kr', 'ignore'), 'html.parser')
+                    links = soup.find_all('a', href=True)
+                    for a in links:
+                        href = a['href']
+                        if '/item/main.naver?code=' in href:
+                            code = href.split('code=')[-1].strip()
+                            name = a.get_text(strip=True)
+                            if code and name and len(code) == 6:
                                 if not any(x in name for x in ["스팩", "우B", "우C", "ETF", "ETN", "리츠", "인버스", "레버리지"]):
                                     candidates[code] = name
             except Exception: pass
@@ -52,13 +56,13 @@ def fetch_top_candidate_stocks(market_type):
     return candidates
 
 # ==========================================
-# 3. 차트 분석 엔진
+# 3. 차트 및 수급 분석 엔진
 # ==========================================
-def analyze_stock_v73(item, min_trade_val):
+def analyze_stock_v74(item, min_trade_val):
     code, name = item
     try:
         url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count=60&requestType=0"
-        res = requests.get(url, headers=headers, timeout=2)
+        res = requests.get(url, headers=headers, timeout=3)
         if res.status_code != 200 or "<item data=" not in res.text: 
             return None
 
@@ -101,7 +105,6 @@ def analyze_stock_v73(item, min_trade_val):
         today_change = ((c - p_c) / p_c) * 100
         rsi_val = latest['RSI'] if not np.isnan(latest['RSI']) else 50
         
-        # 기본 필터링 (정배열 또는 RSI 상승세)
         if c < latest['MA5']:
             return None
             
@@ -132,14 +135,17 @@ min_trade_val = st.sidebar.number_input("최소 거래대금 (억원)", value=10
 st.markdown("---")
 
 if st.button("📈 주도주 스캔 시작", type="primary"):
-    with st.spinner("후보 종목 수집 중..."):
+    # 캐시 지우기 버튼 기능 겸용
+    fetch_top_candidate_stocks.clear()
+    
+    with st.spinner("네이버 실시간 후보 종목 수집 중..."):
         TARGET_STOCKS = fetch_top_candidate_stocks(market_choice)
         
     if TARGET_STOCKS:
-        with st.spinner(f"{len(TARGET_STOCKS)}개 종목 정밀 분석 중..."):
+        with st.spinner(f"{len(TARGET_STOCKS)}개 종목 분석 중..."):
             results = []
             with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = [executor.submit(analyze_stock_v73, item, min_trade_val) for item in TARGET_STOCKS.items()]
+                futures = [executor.submit(analyze_stock_v74, item, min_trade_val) for item in TARGET_STOCKS.items()]
                 for future in as_completed(futures):
                     res = future.result()
                     if res: results.append(res)
@@ -152,4 +158,4 @@ if st.button("📈 주도주 스캔 시작", type="primary"):
             else:
                 st.warning("조건을 만족하는 종목이 없습니다. 최소 거래대금을 낮춰보세요.")
     else:
-        st.error("종목 목록을 가져오지 못했습니다. 잠시 후 다시 시도해주세요.")
+        st.error("종목 목록 수집 실패. 잠시 후 다시 스캔 버튼을 눌러주세요.")
