@@ -1,20 +1,19 @@
-import json
-import urllib.request
 import pandas as pd
 import streamlit as st
+import yfinance as yf
 
 # ==========================================
 # 1. 스트림릿 페이지 기본 설정
 # ==========================================
 st.set_page_config(
-    page_title="KRX 삼중 모드 실시간 주식 스캐너 V14.0",
+    page_title="KRX 삼중 모드 실시간 주식 스캐너 V15.0",
     page_icon="📈",
     layout="wide",
 )
 
-st.title("⚡ KRX 삼중 모드(현재장/오전/저녁) 실시간 주식 스캐너 V14.0")
+st.title("⚡ KRX 삼중 모드(현재장/오전/저녁) 실시간 주식 스캐너 V15.0")
 st.markdown(
-    "**클라우드 차단 회피 초경량 엔진 연동** | 철저한 **-1.5% ~ -2% 손절 준수** 기준 스캐너입니다."
+    "**Yahoo Finance 글로벌 차단 회피 엔진** | 철저한 **-1.5% ~ -2% 손절 준수** 기준 스캐너입니다."
 )
 st.markdown("---")
 
@@ -25,7 +24,7 @@ st.sidebar.header("⚙️ 스캔 모드 선택")
 scan_mode = st.sidebar.radio(
     "스캔 모드를 선택하세요",
     [
-        "🔥 현재장 모드 (정규장 실시간 모멘텀/거래대금)",
+        "🔥 현재장 모드 (정규장 실시간 모멘텀)",
         "☀️ 오전장 모드 (08:00~08:50 장전/시초가 수급)",
         "🌆 저녁장 모드 (19:30 애프터마켓/시간외)",
     ],
@@ -37,84 +36,90 @@ st.sidebar.error("• 원칙 손절가: -1.5% ~ -2.0% 준수")
 st.sidebar.warning("• 금요일/미장 변동성: 비중 50% 축소")
 st.sidebar.info("• 단타 실패 시 절대 스윙 전환 금지")
 
+# ==========================================
+# 3. 주요 KRX 관심/대형주 목록 (서버 차단 회피용)
+# ==========================================
+STOCK_TARGETS = [
+    {"name": "삼성전자", "code": "005930.KS"},
+    {"name": "SK하이닉스", "code": "000660.KS"},
+    {"name": "LG에너지솔루션", "code": "373220.KS"},
+    {"name": "삼성바이오로직스", "code": "207940.KS"},
+    {"name": "현대차", "code": "005380.KS"},
+    {"name": "셀트리온", "code": "068270.KS"},
+    {"name": "기아", "code": "000270.KS"},
+    {"name": "KB금융", "code": "105560.KS"},
+    {"name": "POSCO홀딩스", "code": "005490.KS"},
+    {"name": "NAVER", "code": "035420.KS"},
+    {"name": "카카오", "code": "035720.KS"},
+    {"name": "삼성SDI", "code": "006400.KS"},
+    {"name": "한화에어로스페이스", "code": "012450.KS"},
+    {"name": "알테오젠", "code": "196170.KQ"},
+    {"name": "에코프로비엠", "code": "247540.KQ"},
+    {"name": "에코프로", "code": "086520.KQ"},
+]
+
 
 # ==========================================
-# 3. 우회 연동 실시간 데이터 수집 엔진
+# 4. 차단 회피 실시간 시세 수집 함수
 # ==========================================
 @st.cache_data(ttl=30)
-def fetch_realtime_stocks():
-    """네이버 금융 모바일 실시간 상위 시세 API파싱 (우회 헤더 적용)"""
-    url = "https://m.stock.naver.com/api/index/KOSPI/marketValue?page=1&pageSize=20"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 "
-            "Mobile/15E148 Safari/604.1"
-        ),
-        "Referer": "https://m.stock.naver.com/",
-    }
+def fetch_yf_data():
+    """Yahoo Finance API를 통한 IP 차단 프리 시세 수집"""
+    results = []
+    tickers_str = " ".join([item["code"] for item in STOCK_TARGETS])
 
     try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=5) as response:
-            res_body = response.read().decode("utf-8")
-            data = json.loads(res_body)
+        data = yf.Tickers(tickers_str)
+        for item in STOCK_TARGETS:
+            code = item["code"]
+            name = item["name"]
 
-        stocks = data if isinstance(data, list) else data.get("stocks", [])
-        results = []
-
-        for s in stocks:
-            name = s.get("stockName") or s.get("itemNm", "")
-            code = s.get("itemCode") or s.get("crno", "")
-
-            close_str = str(s.get("closePrice", "0")).replace(",", "")
-            price = int(close_str) if close_str.isdigit() else 0
-
-            diff_str = str(
-                s.get("compareToPreviousClosePrice", "0")
-            ).replace(",", "")
-            diff_price = int(diff_str) if diff_str.isdigit() else 0
-
-            rate_str = str(s.get("fluctuationsRatio", "0")).replace(",", "")
             try:
-                change_rate = float(rate_str)
-            except ValueError:
-                change_rate = 0.0
+                # 최근 2일 간의 일봉 데이터 수집
+                hist = data.tickers[code].history(period="2d")
+                if len(hist) >= 1:
+                    price = int(hist["Close"].iloc[-1])
+                    prev_close = (
+                        int(hist["Close"].iloc[-2])
+                        if len(hist) >= 2
+                        else price
+                    )
 
-            comp_code = str(
-                s.get("compareToPreviousPrice", {}).get("code", "3")
-            )
-            if comp_code in ["1", "2"]:  # 상승
-                prev_close = price - diff_price
-            elif comp_code in ["4", "5"]:  # 하락
-                prev_close = price + diff_price
-            else:
-                prev_close = price
+                    if prev_close > 0:
+                        change_rate = (
+                            (price - prev_close) / prev_close
+                        ) * 100
+                    else:
+                        change_rate = 0.0
 
-            if price > 0:
-                results.append(
-                    {
-                        "code": code,
-                        "name": name,
-                        "price": price,
-                        "prev_close": prev_close,
-                        "change_rate": change_rate,
-                    }
-                )
+                    results.append(
+                        {
+                            "code": code.split(".")[0],
+                            "name": name,
+                            "price": price,
+                            "prev_close": prev_close,
+                            "change_rate": change_rate,
+                        }
+                    )
+            except Exception:
+                continue
 
+        # 등락률 높은 순으로 정렬
+        results.sort(key=lambda x: x["change_rate"], reverse=True)
         return results
+
     except Exception as e:
-        st.error(f"⚠️ 실시간 데이터 연동 중 오류가 발생했습니다: {e}")
+        st.error(f"⚠️ Yahoo Finance 데이터 처리 중 오류 발생: {e}")
         return []
 
 
 def get_realtime_scanner():
-    raw_data = fetch_realtime_stocks()
+    raw_data = fetch_yf_data()
     if not raw_data:
         return pd.DataFrame()
 
     results = []
-    for idx, item in enumerate(raw_data[:10], 1):
+    for idx, item in enumerate(raw_data, 1):
         momentum_score = int(min(99, max(60, 70 + item["change_rate"] * 2)))
         results.append(
             {
@@ -127,7 +132,7 @@ def get_realtime_scanner():
                 "모멘텀 점수": f"{momentum_score}점",
                 "진입 판단": (
                     "🔥 강한 돌파"
-                    if item["change_rate"] > 3.0
+                    if item["change_rate"] > 2.0
                     else "🟢 수급 유입"
                 ),
             }
@@ -136,7 +141,7 @@ def get_realtime_scanner():
 
 
 def get_aftermarket_scanner():
-    raw_data = fetch_realtime_stocks()
+    raw_data = fetch_yf_data()
     if not raw_data:
         return pd.DataFrame()
 
@@ -163,7 +168,7 @@ def get_aftermarket_scanner():
 
 
 def get_morning_scanner():
-    raw_data = fetch_realtime_stocks()
+    raw_data = fetch_yf_data()
     if not raw_data:
         return pd.DataFrame()
 
@@ -181,7 +186,7 @@ def get_morning_scanner():
                 "오전 점수": f"{gap_score}점",
                 "진입 가이드": (
                     "🚀 시초가 타점 유효"
-                    if item["change_rate"] > 1.5
+                    if item["change_rate"] > 1.0
                     else "⚠️ 갭미달/주의"
                 ),
             }
@@ -190,12 +195,12 @@ def get_morning_scanner():
 
 
 # ==========================================
-# 4. 메인 화면 - UI 분기
+# 5. 메인 화면 - UI 분기
 # ==========================================
 if "현재장" in scan_mode:
     st.header("🔥 [현재장 모드] 정규장 실시간 모멘텀 & 수급 스캐너")
     st.info(
-        "💡 **전략 안내**: 현재 주식 시장에서 실시간으로 거래대금과 수급이 몰리는 상위 종목을 포착합니다."
+        "💡 **전략 안내**: 글로벌 시세 엔진(Yahoo Finance)을 통해 차단 없이 주요 종목 모멘텀을 스캔합니다."
     )
 
     col1, col2, col3 = st.columns(3)
@@ -204,11 +209,11 @@ if "현재장" in scan_mode:
     col3.metric("필수 손절가", "-1.5% ~ -2.0%")
 
     if st.button("🚀 현재장 실시간 스캔 실행", type="primary"):
-        with st.spinner("실시간 시세 수집 중..."):
+        with st.spinner("글로벌 금융 데이터 수집 중..."):
             df_now = get_realtime_scanner()
 
         if not df_now.empty:
-            st.success("✅ 실시간 스캔 성공! 현재 모멘텀 상위 종목")
+            st.success("✅ 실시간 스캔 성공!")
             st.dataframe(df_now, use_container_width=True)
         else:
             st.error("데이터 수집에 실패했습니다. 잠시 후 시도해 보세요.")
@@ -229,7 +234,7 @@ elif "오전장" in scan_mode:
             df_morning = get_morning_scanner()
 
         if not df_morning.empty:
-            st.success("✅ 실시간 스캔 성공! 오전장 진입 후보 종목")
+            st.success("✅ 실시간 스캔 성공!")
             st.dataframe(df_morning, use_container_width=True)
         else:
             st.error("데이터 수집에 실패했습니다. 잠시 후 시도해 보세요.")
@@ -250,10 +255,10 @@ else:
             df_after = get_aftermarket_scanner()
 
         if not df_after.empty:
-            st.success("✅ 실시간 스캔 성공! 오버나이트 후보 종목")
+            st.success("✅ 실시간 스캔 성공!")
             st.dataframe(df_after, use_container_width=True)
         else:
             st.error("데이터 수집에 실패했습니다. 잠시 후 시도해 보세요.")
 
 st.markdown("---")
-st.caption("KRX Automated Trading Engine V14.0")
+st.caption("KRX Automated Trading Engine V15.0")
