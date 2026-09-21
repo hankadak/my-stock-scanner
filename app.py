@@ -39,91 +39,104 @@ st.sidebar.info("• 오버나이트 단타 실패 시 절대 스윙 전환 금�
 
 
 # ==========================================
-# 3. 네이버 금융 공식 실시간 JSON API 파싱
+# 3. 네이버 금융 최신 실시간 API 파싱
 # ==========================================
-@st.cache_data(ttl=30)  # 30초 캐싱
+@st.cache_data(ttl=15)  # 15초 캐싱
 def fetch_naver_realtime_api():
-    """네이버 거래대금/시세 상위 실시간 JSON 데이터 수집"""
-    url = "https://m.stock.naver.com/api/json/sise/siseListJson.nhn?menu=market_sum&sosok=0"
+    """네이버 금융 거래대금/상승 상위 실시간 API 수집"""
+    # 네이버 금융 모바일 실시간 상위 종목 엔드포인트
+    url = "https://m.stock.naver.com/api/index/KOSPI/marketValue?page=1&pageSize=15"
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://m.stock.naver.com/",
+        "Accept": "application/json, text/plain, */*",
     }
+
+    parsed_list = []
 
     try:
         response = requests.get(url, headers=headers, timeout=5)
 
-        # 모바일 API 차단 시 백업 코스피/코스닥 상위 API 사용
-        if response.status_code != 200:
-            url = "https://api.stock.naver.com/stock/exchange/KOSPI/marketValue?page=1&pageSize=15"
-            response = requests.get(url, headers=headers, timeout=5)
+        if response.status_code == 200:
             data = response.json()
-            stocks = data.get("stocks", [])
 
-            parsed_list = []
+            # 코스피/코스닥 구조에 따른 데이터 파싱
+            stocks = data if isinstance(data, list) else data.get("stocks", [])
+
             for s in stocks:
-                now_price = int(s.get("closePrice", "0").replace(",", ""))
-                diff_price = int(
-                    s.get("compareToPreviousClosePrice", "0").replace(",", "")
+                name = s.get("stockName") or s.get("itemNm", "종목명없음")
+                code = s.get("itemCode") or s.get("crno", "")
+
+                # 가격 데이터 정제
+                close_str = str(s.get("closePrice", "0")).replace(",", "")
+                now_price = int(close_str) if close_str.isdigit() else 0
+
+                diff_str = str(
+                    s.get("compareToPreviousClosePrice", "0")
+                ).replace(",", "")
+                diff_price = int(diff_str) if diff_str.isdigit() else 0
+
+                rate_str = str(s.get("fluctuationsRatio", "0")).replace(
+                    ",", ""
                 )
-                change_rate = float(
-                    s.get("fluctuationsRatio", "0").replace(",", "")
+                try:
+                    change_rate = float(rate_str)
+                except ValueError:
+                    change_rate = 0.0
+
+                # 상승/하락 여부에 따른 전일 종가 계산
+                comp_code = str(
+                    s.get("compareToPreviousPrice", {}).get("code", "3")
                 )
+                if comp_code in ["1", "2"]:  # 상한 / 상승
+                    prev_close = now_price - diff_price
+                elif comp_code in ["4", "5"]:  # 하한 / 하락
+                    prev_close = now_price + diff_price
+                else:
+                    prev_close = now_price
 
-                # 전일 종가 계산
-                prev_close = (
-                    now_price - diff_price
-                    if s.get("compareToPreviousPrice", {}).get("code") == "2"
-                    else now_price + diff_price
+                if now_price > 0:
+                    parsed_list.append(
+                        {
+                            "code": code,
+                            "name": name,
+                            "price": now_price,
+                            "prev_close": prev_close,
+                            "change_rate": change_rate,
+                        }
+                    )
+
+        # 1차 요청이 비어있을 경우 코스닥 API 대체 호출 (백업)
+        if not parsed_list:
+            url_kosdaq = "https://m.stock.naver.com/api/index/KOSDAQ/marketValue?page=1&pageSize=15"
+            res_kd = requests.get(url_kosdaq, headers=headers, timeout=5)
+            if res_kd.status_code == 200:
+                data_kd = res_kd.json()
+                stocks_kd = (
+                    data_kd
+                    if isinstance(data_kd, list)
+                    else data_kd.get("stocks", [])
                 )
-
-                parsed_list.append(
-                    {
-                        "code": s.get("itemCode"),
-                        "name": s.get("stockName"),
-                        "price": now_price,
-                        "prev_close": prev_close,
-                        "change_rate": change_rate,
-                    }
-                )
-            return parsed_list
-
-        # 기본 JSON 파싱
-        result_data = response.json()
-        items = (
-            result_data.get("result", {})
-            .get("siseList", [])
-        )
-
-        parsed_list = []
-        for item in items[:15]:
-            now_price = int(item.get("nowValue", 0))
-            change_rate = float(item.get("changeRate", 0.0))
-            diff_value = int(item.get("changeValue", 0))
-
-            # 상승/하락에 따른 전일 종가 역산
-            if item.get("rf") in ["1", "2"]:  # 상한가 / 상승
-                prev_close = now_price - diff_value
-            elif item.get("rf") in ["4", "5"]:  # 하한가 / 하락
-                prev_close = now_price + diff_value
-            else:
-                prev_close = now_price
-
-            parsed_list.append(
-                {
-                    "code": item.get("cd"),
-                    "name": item.get("nm"),
-                    "price": now_price,
-                    "prev_close": prev_close,
-                    "change_rate": change_rate,
-                }
-            )
+                for s in stocks_kd:
+                    now_price = int(
+                        str(s.get("closePrice", "0")).replace(",", "")
+                    )
+                    parsed_list.append(
+                        {
+                            "code": s.get("itemCode", ""),
+                            "name": s.get("stockName", ""),
+                            "price": now_price,
+                            "prev_close": now_price,
+                            "change_rate": float(
+                                s.get("fluctuationsRatio", 0)
+                            ),
+                        }
+                    )
 
         return parsed_list
 
     except Exception as e:
-        # API 오류 발생 시 백업용 더미 안내 반환
-        st.error(f"실시간 데이터 연결 오류: {e}")
+        st.error(f"⚠️ API 통신 오류 원인: {e}")
         return []
 
 
@@ -209,7 +222,7 @@ if "저녁장" in scan_mode:
             )
         else:
             st.error(
-                "데이터를 가져오지 못했습니다. 인터넷 연결 및 잠시 후 다시 시도해 보세요."
+                "데이터 수집 실패: PC 인터넷 연결을 확인하거나 잠시 후 다시 시도해 주세요."
             )
 
 # ==========================================
@@ -239,7 +252,7 @@ else:
             )
         else:
             st.error(
-                "데이터를 가져오지 못했습니다. 인터넷 연결 및 잠시 후 다시 시도해 보세요."
+                "데이터 수집 실패: PC 인터넷 연결을 확인하거나 잠시 후 다시 시도해 주세요."
             )
 
 # ==========================================
