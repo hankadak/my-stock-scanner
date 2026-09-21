@@ -1,5 +1,5 @@
-import datetime
-import FinanceDataReader as fdr
+import json
+import urllib.request
 import pandas as pd
 import streamlit as st
 
@@ -7,14 +7,14 @@ import streamlit as st
 # 1. 스트림릿 페이지 기본 설정
 # ==========================================
 st.set_page_config(
-    page_title="KRX 삼중 모드 실시간 주식 스캐너 V13.0",
+    page_title="KRX 삼중 모드 실시간 주식 스캐너 V14.0",
     page_icon="📈",
     layout="wide",
 )
 
-st.title("⚡ KRX 삼중 모드(저녁/오전/현재장) 실시간 주식 스캐너 V13.0")
+st.title("⚡ KRX 삼중 모드(현재장/오전/저녁) 실시간 주식 스캐너 V14.0")
 st.markdown(
-    "**FDR 차단회피 엔진 연동** | 철저한 **-1.5% ~ -2% 손절 준수** 기준 1차 스캐닝 시스템입니다."
+    "**클라우드 차단 회피 초경량 엔진 연동** | 철저한 **-1.5% ~ -2% 손절 준수** 기준 스캐너입니다."
 )
 st.markdown("---")
 
@@ -39,55 +39,77 @@ st.sidebar.info("• 단타 실패 시 절대 스윙 전환 금지")
 
 
 # ==========================================
-# 3. 차단 회피형 시장 데이터 수집 함수
+# 3. 우회 연동 실시간 데이터 수집 엔진
 # ==========================================
 @st.cache_data(ttl=30)
-def fetch_market_fdr():
-    """FinanceDataReader를 활용한 KRX 전종목 실시간 시세 파싱"""
+def fetch_realtime_stocks():
+    """네이버 금융 모바일 실시간 상위 시세 API파싱 (우회 헤더 적용)"""
+    url = "https://m.stock.naver.com/api/index/KOSPI/marketValue?page=1&pageSize=20"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 "
+            "Mobile/15E148 Safari/604.1"
+        ),
+        "Referer": "https://m.stock.naver.com/",
+    }
+
     try:
-        df_krx = fdr.StockListing("KRX")
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as response:
+            res_body = response.read().decode("utf-8")
+            data = json.loads(res_body)
 
-        # 거래량 존재하는 종목 필터링
-        df_filtered = df_krx[df_krx["Volume"] > 0].copy()
-
-        # 등락률 및 거래대금 기준 정렬
-        df_sorted = df_filtered.sort_values(
-            by="ChgRate", ascending=False
-        ).head(15)
-
+        stocks = data if isinstance(data, list) else data.get("stocks", [])
         results = []
-        for _, row in df_sorted.iterrows():
-            code = str(row["Code"])
-            name = str(row["Name"])
-            price = int(row["Close"])
-            change_rate = float(row["ChgRate"]) * 100
 
-            prev_close = (
-                int(round(price / (1 + (change_rate / 100))))
-                if change_rate != -100
-                else price
-            )
+        for s in stocks:
+            name = s.get("stockName") or s.get("itemNm", "")
+            code = s.get("itemCode") or s.get("crno", "")
 
-            results.append(
-                {
-                    "code": code,
-                    "name": name,
-                    "price": price,
-                    "prev_close": prev_close,
-                    "change_rate": change_rate,
-                    "volume": int(row["Volume"]),
-                }
+            close_str = str(s.get("closePrice", "0")).replace(",", "")
+            price = int(close_str) if close_str.isdigit() else 0
+
+            diff_str = str(
+                s.get("compareToPreviousClosePrice", "0")
+            ).replace(",", "")
+            diff_price = int(diff_str) if diff_str.isdigit() else 0
+
+            rate_str = str(s.get("fluctuationsRatio", "0")).replace(",", "")
+            try:
+                change_rate = float(rate_str)
+            except ValueError:
+                change_rate = 0.0
+
+            comp_code = str(
+                s.get("compareToPreviousPrice", {}).get("code", "3")
             )
+            if comp_code in ["1", "2"]:  # 상승
+                prev_close = price - diff_price
+            elif comp_code in ["4", "5"]:  # 하락
+                prev_close = price + diff_price
+            else:
+                prev_close = price
+
+            if price > 0:
+                results.append(
+                    {
+                        "code": code,
+                        "name": name,
+                        "price": price,
+                        "prev_close": prev_close,
+                        "change_rate": change_rate,
+                    }
+                )
 
         return results
     except Exception as e:
-        st.error(f"⚠️ 데이터 로딩 실패: {e}")
+        st.error(f"⚠️ 실시간 데이터 연동 중 오류가 발생했습니다: {e}")
         return []
 
 
 def get_realtime_scanner():
-    """현재 정규장 실시간 거래대금 및 돌파 후보 산출"""
-    raw_data = fetch_market_fdr()
+    raw_data = fetch_realtime_stocks()
     if not raw_data:
         return pd.DataFrame()
 
@@ -103,7 +125,6 @@ def get_realtime_scanner():
                 "전일 종가": f"{item['prev_close']:,}원",
                 "실시간 등락률": f"{item['change_rate']:+.2f}%",
                 "모멘텀 점수": f"{momentum_score}점",
-                "거래량": f"{item['volume']:,}주",
                 "진입 판단": (
                     "🔥 강한 돌파"
                     if item["change_rate"] > 3.0
@@ -115,8 +136,7 @@ def get_realtime_scanner():
 
 
 def get_aftermarket_scanner():
-    """저녁장(19:30) 시간외 및 오버나이트 후보 산출"""
-    raw_data = fetch_market_fdr()
+    raw_data = fetch_realtime_stocks()
     if not raw_data:
         return pd.DataFrame()
 
@@ -143,8 +163,7 @@ def get_aftermarket_scanner():
 
 
 def get_morning_scanner():
-    """오전장(08:00~08:50) 장전 갭상승 후보 산출"""
-    raw_data = fetch_market_fdr()
+    raw_data = fetch_realtime_stocks()
     if not raw_data:
         return pd.DataFrame()
 
@@ -171,7 +190,7 @@ def get_morning_scanner():
 
 
 # ==========================================
-# 4. 메인 화면 - 1) 현재장 모드 UI
+# 4. 메인 화면 - UI 분기
 # ==========================================
 if "현재장" in scan_mode:
     st.header("🔥 [현재장 모드] 정규장 실시간 모멘텀 & 수급 스캐너")
@@ -184,22 +203,16 @@ if "현재장" in scan_mode:
     col2.metric("목표 익절가", "+2.0% ~ +4.0%")
     col3.metric("필수 손절가", "-1.5% ~ -2.0%")
 
-    if st.button("🚀 현재장 실시간 모멘텀 스캔 실행", type="primary"):
-        with st.spinner("KRX 실시간 체결 시세 조회 중..."):
+    if st.button("🚀 현재장 실시간 스캔 실행", type="primary"):
+        with st.spinner("실시간 시세 수집 중..."):
             df_now = get_realtime_scanner()
 
         if not df_now.empty:
             st.success("✅ 실시간 스캔 성공! 현재 모멘텀 상위 종목")
             st.dataframe(df_now, use_container_width=True)
-            st.caption(
-                "※ 스캔 결과 상위 종목을 AI에게 알려주시면 차트 매물대 및 뉴스 악재 여부를 2차 판정해 드립니다."
-            )
         else:
             st.error("데이터 수집에 실패했습니다. 잠시 후 시도해 보세요.")
 
-# ==========================================
-# 5. 메인 화면 - 2) 오전장 모드 UI
-# ==========================================
 elif "오전장" in scan_mode:
     st.header("☀️ [오전장 모드] 08:00~08:50 실시간 장전 수급 스캐너")
     st.info(
@@ -212,7 +225,7 @@ elif "오전장" in scan_mode:
     col3.metric("손절 기준", "-1.0% ~ -1.5% (타이트하게)")
 
     if st.button("🚀 오전장 실시간 스캔 실행", type="primary"):
-        with st.spinner("장전 수급 데이터 수집 중..."):
+        with st.spinner("장전 수급 수집 중..."):
             df_morning = get_morning_scanner()
 
         if not df_morning.empty:
@@ -221,9 +234,6 @@ elif "오전장" in scan_mode:
         else:
             st.error("데이터 수집에 실패했습니다. 잠시 후 시도해 보세요.")
 
-# ==========================================
-# 6. 메인 화면 - 3) 저녁장 모드 UI
-# ==========================================
 else:
     st.header("🌆 [저녁장 모드] 19:30 애프터마켓 실시간 수급 스캐너")
     st.info(
@@ -236,7 +246,7 @@ else:
     col3.metric("필수 손절가", "-1.5% ~ -2.0%")
 
     if st.button("🚀 저녁장 실시간 스캔 실행", type="primary"):
-        with st.spinner("시간외 시세 데이터 파싱 중..."):
+        with st.spinner("시간외 시세 수집 중..."):
             df_after = get_aftermarket_scanner()
 
         if not df_after.empty:
@@ -246,4 +256,4 @@ else:
             st.error("데이터 수집에 실패했습니다. 잠시 후 시도해 보세요.")
 
 st.markdown("---")
-st.caption("KRX Automated Trading Engine V13.0")
+st.caption("KRX Automated Trading Engine V14.0")
