@@ -1,20 +1,21 @@
 import datetime
+import json
+import urllib.request
 import pandas as pd
-from pykrx import stock
 import streamlit as st
 
 # ==========================================
 # 1. 스트림릿 페이지 기본 설정
 # ==========================================
 st.set_page_config(
-    page_title="KRX 모멘텀/수급 자동 스캐너 V12.1",
+    page_title="KRX 모멘텀/수급 자동 스캐너 V12.2",
     page_icon="📈",
     layout="wide",
 )
 
-st.title("⚡ KRX 이중 모드(저녁/오전) 실시간 주식 스캐너 V12.1")
+st.title("⚡ KRX 이중 모드(저녁/오전) 실시간 주식 스캐너 V12.2")
 st.markdown(
-    "**KRX 공식 데이터 엔진 연동** | 철저한 **-1.5% ~ -2% 손절 준수** 기준 1차 스캐닝 시스템입니다."
+    "**KRX 실시간 API 연동** | 철저한 **-1.5% ~ -2% 손절 준수** 기준 1차 스캐닝 시스템입니다."
 )
 st.markdown("---")
 
@@ -38,74 +39,78 @@ st.sidebar.info("• 오버나이트 단타 실패 시 절대 스윙 전환 금�
 
 
 # ==========================================
-# 3. KRX 공식 시세 수집 함수 (최근 영업일 자동 탐색)
+# 3. 경량화 실시간 API 수집 함수
 # ==========================================
-@st.cache_data(ttl=300)
-def fetch_krx_market_data():
-    """KRX 최근 영업일 기준 거래대금/등락률 상위 데이터 수집"""
+@st.cache_data(ttl=30)
+def fetch_realtime_data():
+    """외부 의존 패키지 없이 기본 urllib으로 실시간 코스피/코스닥 상위 시세 파싱"""
+    url = "https://m.stock.naver.com/api/index/KOSPI/marketValue?page=1&pageSize=15"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://m.stock.naver.com/",
+        },
+    )
+
     try:
-        now = datetime.datetime.now()
-        # 최근 영업일 구하기 (오늘부터 역산하여 데이터가 있는 날 탐색)
-        target_date = now
-        df_kospi = pd.DataFrame()
+        with urllib.request.urlopen(req, timeout=5) as response:
+            res_body = response.read().decode("utf-8")
+            data = json.loads(res_body)
 
-        for _ in range(7):  # 최대 7일 전까지 탐색
-            date_str = target_date.strftime("%Y%m%d")
-            try:
-                df_kospi = stock.get_market_ohlcv_by_ticker(
-                    date_str, market="KOSPI"
-                )
-                if not df_kospi.empty and df_kospi["거래량"].sum() > 0:
-                    break
-            except Exception:
-                pass
-            target_date -= datetime.timedelta(days=1)
-
-        date_str = target_date.strftime("%Y%m%d")
-        df_kosdaq = stock.get_market_ohlcv_by_ticker(date_str, market="KOSDAQ")
-
-        # 데이터 결합
-        df = pd.concat([df_kospi, df_kosdaq])
-        df = df[df["거래량"] > 0]
-
-        # 등락률 상위 15개 필터링
-        df = df.sort_values(by="등락률", ascending=False).head(15)
-
+        stocks = data if isinstance(data, list) else data.get("stocks", [])
         results = []
-        for ticker in df.index:
-            name = stock.get_market_ticker_name(ticker)
-            close_price = int(df.loc[ticker, "종가"])
-            change_rate = float(df.loc[ticker, "등락률"])
 
-            prev_close = (
-                int(round(close_price / (1 + (change_rate / 100))))
-                if change_rate != -100
-                else close_price
-            )
+        for s in stocks:
+            name = s.get("stockName") or s.get("itemNm", "")
+            code = s.get("itemCode") or s.get("crno", "")
 
-            results.append(
-                {
-                    "code": ticker,
-                    "name": name,
-                    "price": close_price,
-                    "prev_close": prev_close,
-                    "change_rate": change_rate,
-                    "base_date": date_str,
-                }
+            close_str = str(s.get("closePrice", "0")).replace(",", "")
+            now_price = int(close_str) if close_str.isdigit() else 0
+
+            diff_str = str(
+                s.get("compareToPreviousClosePrice", "0")
+            ).replace(",", "")
+            diff_price = int(diff_str) if diff_str.isdigit() else 0
+
+            rate_str = str(s.get("fluctuationsRatio", "0")).replace(",", "")
+            try:
+                change_rate = float(rate_str)
+            except ValueError:
+                change_rate = 0.0
+
+            comp_code = str(
+                s.get("compareToPreviousPrice", {}).get("code", "3")
             )
+            if comp_code in ["1", "2"]:
+                prev_close = now_price - diff_price
+            elif comp_code in ["4", "5"]:
+                prev_close = now_price + diff_price
+            else:
+                prev_close = now_price
+
+            if now_price > 0:
+                results.append(
+                    {
+                        "code": code,
+                        "name": name,
+                        "price": now_price,
+                        "prev_close": prev_close,
+                        "change_rate": change_rate,
+                    }
+                )
 
         return results
     except Exception as e:
-        st.error(f"⚠️ KRX 데이터 연동 오류 발생: {e}")
+        st.error(f"⚠️ 실시간 데이터 연동 중 문제 발생: {e}")
         return []
 
 
 def get_aftermarket_scanner():
-    raw_data = fetch_krx_market_data()
+    raw_data = fetch_realtime_data()
     if not raw_data:
-        return pd.DataFrame(), ""
+        return pd.DataFrame()
 
-    base_date = raw_data[0]["base_date"]
     results = []
     for idx, item in enumerate(raw_data[:8], 1):
         score = int(min(99, max(60, 70 + item["change_rate"] * 2)))
@@ -116,7 +121,7 @@ def get_aftermarket_scanner():
                 "종목코드": item["code"],
                 "실시간 현재가": f"{item['price']:,}원",
                 "전일 종가": f"{item['prev_close']:,}원",
-                "등락률": f"{item['change_rate']:+.2f}%",
+                "실시간 등락률": f"{item['change_rate']:+.2f}%",
                 "수급 점수": f"{score}점",
                 "상태": (
                     "🟢 수급 양호"
@@ -125,15 +130,14 @@ def get_aftermarket_scanner():
                 ),
             }
         )
-    return pd.DataFrame(results), base_date
+    return pd.DataFrame(results)
 
 
 def get_morning_scanner():
-    raw_data = fetch_krx_market_data()
+    raw_data = fetch_realtime_data()
     if not raw_data:
-        return pd.DataFrame(), ""
+        return pd.DataFrame()
 
-    base_date = raw_data[0]["base_date"]
     results = []
     for idx, item in enumerate(raw_data[:8], 1):
         gap_score = int(min(98, max(65, 75 + item["change_rate"] * 1.8)))
@@ -153,7 +157,7 @@ def get_morning_scanner():
                 ),
             }
         )
-    return pd.DataFrame(results), base_date
+    return pd.DataFrame(results)
 
 
 # ==========================================
@@ -171,18 +175,14 @@ if "저녁장" in scan_mode:
     col3.metric("필수 손절가", "-1.5% ~ -2.0%")
 
     if st.button("🚀 저녁장 실시간 스캔 실행", type="primary"):
-        with st.spinner("KRX 실시간 데이터 파싱 중..."):
-            df_after, base_date = get_aftermarket_scanner()
+        with st.spinner("실시간 시세 데이터 수집 중..."):
+            df_after = get_aftermarket_scanner()
 
         if not df_after.empty:
-            st.success(
-                f"✅ 스캔 성공! (기준 영업일: {base_date[:4]}-{base_date[4:6]}-{base_date[6:]})"
-            )
+            st.success("✅ 실시간 스캔 성공! 오버나이트 후보 종목")
             st.dataframe(df_after, use_container_width=True)
         else:
-            st.error(
-                "데이터를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."
-            )
+            st.error("데이터 수집에 실패했습니다. 잠시 후 시도해 보세요.")
 
 # ==========================================
 # 5. 메인 화면 - 오전장 모드 UI
@@ -199,18 +199,14 @@ else:
     col3.metric("손절 기준", "-1.0% ~ -1.5% (타이트하게)")
 
     if st.button("🚀 오전장 실시간 스캔 실행", type="primary"):
-        with st.spinner("KRX 실시간 장전 수급 파싱 중..."):
-            df_morning, base_date = get_morning_scanner()
+        with st.spinner("실시간 장전 수급 수집 중..."):
+            df_morning = get_morning_scanner()
 
         if not df_morning.empty:
-            st.success(
-                f"✅ 스캔 성공! (기준 영업일: {base_date[:4]}-{base_date[4:6]}-{base_date[6:]})"
-            )
+            st.success("✅ 실시간 스캔 성공! 오전장 진입 후보 종목")
             st.dataframe(df_morning, use_container_width=True)
         else:
-            st.error(
-                "데이터를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."
-            )
+            st.error("데이터 수집에 실패했습니다. 잠시 후 시도해 보세요.")
 
 st.markdown("---")
-st.caption("KRX Automated Trading Engine V12.1 | PyKRX Engine Integrated")
+st.caption("KRX Automated Trading Engine V12.2")
