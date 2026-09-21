@@ -1,7 +1,7 @@
 import datetime
 import time
 import pandas as pd
-import requests
+from pykrx import stock
 import streamlit as st
 
 # ==========================================
@@ -15,7 +15,7 @@ st.set_page_config(
 
 st.title("⚡ KRX 이중 모드(저녁/오전) 실시간 주식 스캐너 V12.0")
 st.markdown(
-    "**네이버 금융 실시간 API 연동** | 철저한 **-1.5% ~ -2% 손절 준수** 기준 1차 스캐닝 엔진입니다."
+    "**KRX 공식 데이터 엔진 연동** | 철저한 **-1.5% ~ -2% 손절 준수** 기준 1차 스캐닝 시스템입니다."
 )
 st.markdown("---")
 
@@ -39,109 +39,59 @@ st.sidebar.info("• 오버나이트 단타 실패 시 절대 스윙 전환 금�
 
 
 # ==========================================
-# 3. 네이버 금융 최신 실시간 API 파싱
+# 3. KRX 공식 시세 수집 함수 (PyKRX 연동)
 # ==========================================
-@st.cache_data(ttl=15)  # 15초 캐싱
-def fetch_naver_realtime_api():
-    """네이버 금융 거래대금/상승 상위 실시간 API 수집"""
-    # 네이버 금융 모바일 실시간 상위 종목 엔드포인트
-    url = "https://m.stock.naver.com/api/index/KOSPI/marketValue?page=1&pageSize=15"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://m.stock.naver.com/",
-        "Accept": "application/json, text/plain, */*",
-    }
-
-    parsed_list = []
-
+@st.cache_data(ttl=60)
+def fetch_krx_market_data():
+    """KRX 코스피/코스닥 거래대금 및 등락률 상위 데이터 수집"""
     try:
-        response = requests.get(url, headers=headers, timeout=5)
+        # 최근 장마감 기준 영업일 날짜 수집
+        now = datetime.datetime.now()
+        today_str = now.strftime("%Y%m%d")
 
-        if response.status_code == 200:
-            data = response.json()
+        # 코스피/코스닥 전종목 시세 조회
+        df_kospi = stock.get_market_ohlcv_by_ticker(today_str, market="KOSPI")
+        df_kosdaq = stock.get_market_ohlcv_by_ticker(today_str, market="KOSDAQ")
 
-            # 코스피/코스닥 구조에 따른 데이터 파싱
-            stocks = data if isinstance(data, list) else data.get("stocks", [])
+        # 데이터 결합
+        df = pd.concat([df_kospi, df_kosdaq])
 
-            for s in stocks:
-                name = s.get("stockName") or s.get("itemNm", "종목명없음")
-                code = s.get("itemCode") or s.get("crno", "")
+        # 거래량 존재하는 종목 중 등락률 상위 15개 필터링
+        df = df[df["거래량"] > 0]
+        df = df.sort_values(by="등락률", ascending=False).head(15)
 
-                # 가격 데이터 정제
-                close_str = str(s.get("closePrice", "0")).replace(",", "")
-                now_price = int(close_str) if close_str.isdigit() else 0
+        results = []
+        for ticker in df.index:
+            name = stock.get_market_ticker_name(ticker)
+            close_price = int(df.loc[ticker, "종가"])
+            change_rate = float(df.loc[ticker, "등락률"])
 
-                diff_str = str(
-                    s.get("compareToPreviousClosePrice", "0")
-                ).replace(",", "")
-                diff_price = int(diff_str) if diff_str.isdigit() else 0
+            # 전일 종가 계산
+            prev_close = (
+                int(round(close_price / (1 + (change_rate / 100))))
+                if change_rate != -100
+                else close_price
+            )
 
-                rate_str = str(s.get("fluctuationsRatio", "0")).replace(
-                    ",", ""
-                )
-                try:
-                    change_rate = float(rate_str)
-                except ValueError:
-                    change_rate = 0.0
+            results.append(
+                {
+                    "code": ticker,
+                    "name": name,
+                    "price": close_price,
+                    "prev_close": prev_close,
+                    "change_rate": change_rate,
+                }
+            )
 
-                # 상승/하락 여부에 따른 전일 종가 계산
-                comp_code = str(
-                    s.get("compareToPreviousPrice", {}).get("code", "3")
-                )
-                if comp_code in ["1", "2"]:  # 상한 / 상승
-                    prev_close = now_price - diff_price
-                elif comp_code in ["4", "5"]:  # 하한 / 하락
-                    prev_close = now_price + diff_price
-                else:
-                    prev_close = now_price
-
-                if now_price > 0:
-                    parsed_list.append(
-                        {
-                            "code": code,
-                            "name": name,
-                            "price": now_price,
-                            "prev_close": prev_close,
-                            "change_rate": change_rate,
-                        }
-                    )
-
-        # 1차 요청이 비어있을 경우 코스닥 API 대체 호출 (백업)
-        if not parsed_list:
-            url_kosdaq = "https://m.stock.naver.com/api/index/KOSDAQ/marketValue?page=1&pageSize=15"
-            res_kd = requests.get(url_kosdaq, headers=headers, timeout=5)
-            if res_kd.status_code == 200:
-                data_kd = res_kd.json()
-                stocks_kd = (
-                    data_kd
-                    if isinstance(data_kd, list)
-                    else data_kd.get("stocks", [])
-                )
-                for s in stocks_kd:
-                    now_price = int(
-                        str(s.get("closePrice", "0")).replace(",", "")
-                    )
-                    parsed_list.append(
-                        {
-                            "code": s.get("itemCode", ""),
-                            "name": s.get("stockName", ""),
-                            "price": now_price,
-                            "prev_close": now_price,
-                            "change_rate": float(
-                                s.get("fluctuationsRatio", 0)
-                            ),
-                        }
-                    )
-
-        return parsed_list
-
+        return results
     except Exception as e:
-        st.error(f"⚠️ API 통신 오류 원인: {e}")
+        st.error(f"⚠️ KRX 데이터 연동 오류 발생: {e}")
         return []
 
 
 def get_aftermarket_scanner():
-    raw_data = fetch_naver_realtime_api()
+    """저녁장(19:30) 시간외 수급 및 오버나이트 후보 산출"""
+    raw_data = fetch_krx_market_data()
     if not raw_data:
         return pd.DataFrame()
 
@@ -168,7 +118,8 @@ def get_aftermarket_scanner():
 
 
 def get_morning_scanner():
-    raw_data = fetch_naver_realtime_api()
+    """오전장(08:00~08:50) 장전/시초가 갭상승 후보 산출"""
+    raw_data = fetch_krx_market_data()
     if not raw_data:
         return pd.DataFrame()
 
@@ -200,7 +151,7 @@ def get_morning_scanner():
 if "저녁장" in scan_mode:
     st.header("🌆 [저녁장 모드] 19:30 애프터마켓 실시간 수급 스캐너")
     st.info(
-        "💡 **실시간 API 연동**: 네이버 금융 공식 시세 API를 불러와 현재가, 전일종가, 등락률을 즉시 계산합니다."
+        "💡 **전략 안내**: 시간외 수급 우상향 종목을 파악하여 다음 날 아침 갭상승 오버나이트 타점을 포착합니다."
     )
 
     col1, col2, col3 = st.columns(3)
@@ -209,7 +160,7 @@ if "저녁장" in scan_mode:
     col3.metric("필수 손절가", "-1.5% ~ -2.0%")
 
     if st.button("🚀 저녁장 실시간 스캔 실행", type="primary"):
-        with st.spinner("네이버 금융 실시간 시세 수집 중..."):
+        with st.spinner("KRX 실시간 데이터 파싱 중..."):
             df_after = get_aftermarket_scanner()
 
         if not df_after.empty:
@@ -218,12 +169,10 @@ if "저녁장" in scan_mode:
 
             st.markdown("### 📋 2차 검증(AI Validator) 가이드")
             st.write(
-                "상위 종목을 알려주시면 **[뉴스 재료 + 차트 매물대 + 미장 변수]**를 반영해 2차 필터링을 진행해 드립니다."
+                "상위 1~3번 종목을 올려주시면 **[뉴스 재료 + 차트 고점 매물대 + 미장 변수]**를 2차 정밀 검증해 드립니다."
             )
         else:
-            st.error(
-                "데이터 수집 실패: PC 인터넷 연결을 확인하거나 잠시 후 다시 시도해 주세요."
-            )
+            st.error("데이터 수집에 실패했습니다.")
 
 # ==========================================
 # 5. 메인 화면 - 오전장 모드 UI
@@ -231,7 +180,7 @@ if "저녁장" in scan_mode:
 else:
     st.header("☀️ [오전장 모드] 08:00~08:50 실시간 장전 수급 스캐너")
     st.info(
-        "💡 **실시간 API 연동**: 실시간 수급 기준 전일종가 대비 예상 갭상승률을 정확히 산출합니다."
+        "💡 **전략 안내**: 장전 동시호가 및 실시간 갭상승 유효 종목을 파악하여 시초가 단타 타점에 활용합니다."
     )
 
     col1, col2, col3 = st.columns(3)
@@ -240,7 +189,7 @@ else:
     col3.metric("손절 기준", "-1.0% ~ -1.5% (타이트하게)")
 
     if st.button("🚀 오전장 실시간 스캔 실행", type="primary"):
-        with st.spinner("실시간 장전 수급 산출 중..."):
+        with st.spinner("KRX 실시간 장전 수급 파싱 중..."):
             df_morning = get_morning_scanner()
 
         if not df_morning.empty:
@@ -251,12 +200,10 @@ else:
                 "⚠️ **시초가 매매 주의**: 정규장(09:00) 개장 직후 갭상승 출하 물량에 유의하세요. -1.5% 이탈 시 즉시 손절해야 합니다."
             )
         else:
-            st.error(
-                "데이터 수집 실패: PC 인터넷 연결을 확인하거나 잠시 후 다시 시도해 주세요."
-            )
+            st.error("데이터 수집에 실패했습니다.")
 
 # ==========================================
 # 6. 하단 푸터
 # ==========================================
 st.markdown("---")
-st.caption("KRX Automated Trading Engine V12.0 | Naver API Integrated")
+st.caption("KRX Automated Trading Engine V12.0 | PyKRX Engine Integrated")
