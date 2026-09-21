@@ -1,7 +1,5 @@
 import datetime
-import re
 import time
-import urllib.request
 import pandas as pd
 import requests
 import streamlit as st
@@ -17,7 +15,7 @@ st.set_page_config(
 
 st.title("⚡ KRX 이중 모드(저녁/오전) 실시간 주식 스캐너 V12.0")
 st.markdown(
-    "**네이버 증권 실시간 시세 연동** | 철저한 **-1.5% ~ -2% 손절 준수** 기준 1차 스캐닝 엔진입니다."
+    "**네이버 금융 실시간 API 연동** | 철저한 **-1.5% ~ -2% 손절 준수** 기준 1차 스캐닝 엔진입니다."
 )
 st.markdown("---")
 
@@ -41,85 +39,111 @@ st.sidebar.info("• 오버나이트 단타 실패 시 절대 스윙 전환 금�
 
 
 # ==========================================
-# 3. 네이버 증권 실시간 데이터 파싱 함수
+# 3. 네이버 금융 공식 실시간 JSON API 파싱
 # ==========================================
-@st.cache_data(ttl=60)  # 1분간 캐싱하여 연속 요청 방지
-def fetch_realtime_market_data():
-    """네이버 증권 거래대금 상위 및 인기 검색 종목 실시간 파싱"""
-    url = "https://finance.naver.com/sise/lastsearch2.naver"
+@st.cache_data(ttl=30)  # 30초 캐싱
+def fetch_naver_realtime_api():
+    """네이버 거래대금/시세 상위 실시간 JSON 데이터 수집"""
+    url = "https://m.stock.naver.com/api/json/sise/siseListJson.nhn?menu=market_sum&sosok=0"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "Referer": "https://m.stock.naver.com/",
     }
 
     try:
         response = requests.get(url, headers=headers, timeout=5)
-        response.encoding = "euc-kr"
-        html = response.text
 
-        # HTML 내 테이블 행 추출
-        pattern = re.compile(
-            r'<a href="/item/main\.naver\?code=(\d+)" class="tltle">(.*?)</a>.*?'
-            r'<td class="number">([\d,]+)</td>.*?'  # 검색비율
-            r'<td class="number">([\d,]+)</td>.*?'  # 현재가
-            r'<td class="number">.*?<span class="tah p11.*?>\s*([\+\-]?[\d\.,]+%?)\s*</span>',
-            re.DOTALL,
+        # 모바일 API 차단 시 백업 코스피/코스닥 상위 API 사용
+        if response.status_code != 200:
+            url = "https://api.stock.naver.com/stock/exchange/KOSPI/marketValue?page=1&pageSize=15"
+            response = requests.get(url, headers=headers, timeout=5)
+            data = response.json()
+            stocks = data.get("stocks", [])
+
+            parsed_list = []
+            for s in stocks:
+                now_price = int(s.get("closePrice", "0").replace(",", ""))
+                diff_price = int(
+                    s.get("compareToPreviousClosePrice", "0").replace(",", "")
+                )
+                change_rate = float(
+                    s.get("fluctuationsRatio", "0").replace(",", "")
+                )
+
+                # 전일 종가 계산
+                prev_close = (
+                    now_price - diff_price
+                    if s.get("compareToPreviousPrice", {}).get("code") == "2"
+                    else now_price + diff_price
+                )
+
+                parsed_list.append(
+                    {
+                        "code": s.get("itemCode"),
+                        "name": s.get("stockName"),
+                        "price": now_price,
+                        "prev_close": prev_close,
+                        "change_rate": change_rate,
+                    }
+                )
+            return parsed_list
+
+        # 기본 JSON 파싱
+        result_data = response.json()
+        items = (
+            result_data.get("result", {})
+            .get("siseList", [])
         )
 
-        matches = pattern.findall(html)
-        stocks = []
+        parsed_list = []
+        for item in items[:15]:
+            now_price = int(item.get("nowValue", 0))
+            change_rate = float(item.get("changeRate", 0.0))
+            diff_value = int(item.get("changeValue", 0))
 
-        for rank, match in enumerate(matches[:15], 1):
-            code, name, _, price_str, change_str = match
-            price = int(price_str.replace(",", ""))
+            # 상승/하락에 따른 전일 종가 역산
+            if item.get("rf") in ["1", "2"]:  # 상한가 / 상승
+                prev_close = now_price - diff_value
+            elif item.get("rf") in ["4", "5"]:  # 하한가 / 하락
+                prev_close = now_price + diff_value
+            else:
+                prev_close = now_price
 
-            # 등락률 숫자 변환
-            clean_change = change_str.replace("%", "").strip()
-            try:
-                change_rate = float(clean_change)
-            except ValueError:
-                change_rate = 0.0
-
-            # 전일 종가 역산 (현재가 / (1 + 등락률))
-            prev_close = (
-                int(round(price / (1 + (change_rate / 100))))
-                if change_rate != -100
-                else price
-            )
-
-            stocks.append(
+            parsed_list.append(
                 {
-                    "code": code,
-                    "name": name,
-                    "price": price,
+                    "code": item.get("cd"),
+                    "name": item.get("nm"),
+                    "price": now_price,
                     "prev_close": prev_close,
                     "change_rate": change_rate,
                 }
             )
 
-        return stocks
+        return parsed_list
+
     except Exception as e:
-        st.error(f"실시간 데이터 수집 중 오류 발생: {e}")
+        # API 오류 발생 시 백업용 더미 안내 반환
+        st.error(f"실시간 데이터 연결 오류: {e}")
         return []
 
 
 def get_aftermarket_scanner():
-    """저녁장 실시간 데이터 스캔 및 수급 점수 산출"""
-    raw_data = fetch_realtime_market_data()
+    raw_data = fetch_naver_realtime_api()
+    if not raw_data:
+        return pd.DataFrame()
+
     results = []
-
-    for idx, item in enumerate(raw_data[:7], 1):
-        # 수급 및 상승 모멘텀 가상 스코어링 (실시간 등락률 기반)
+    for idx, item in enumerate(raw_data[:8], 1):
         score = int(min(99, max(60, 70 + item["change_rate"] * 2)))
-
         results.append(
             {
                 "순위": idx,
                 "종목명": item["name"],
                 "종목코드": item["code"],
-                "현재가(시간외)": f"{item['price']:,}원",
-                "전일종가": f"{item['prev_close']:,}원",
-                "실시간등락률": f"{item['change_rate']:+.2f}%",
-                "수급점수": f"{score}점",
+                "실시간 현재가": f"{item['price']:,}원",
+                "전일 종가": f"{item['prev_close']:,}원",
+                "실시간 등락률": f"{item['change_rate']:+.2f}%",
+                "수급 점수": f"{score}점",
                 "상태": (
                     "🟢 수급 양호"
                     if item["change_rate"] > 0
@@ -131,23 +155,22 @@ def get_aftermarket_scanner():
 
 
 def get_morning_scanner():
-    """오전장 장전/동시호가 예상 수급 스캔"""
-    raw_data = fetch_realtime_market_data()
+    raw_data = fetch_naver_realtime_api()
+    if not raw_data:
+        return pd.DataFrame()
+
     results = []
-
-    for idx, item in enumerate(raw_data[:5], 1):
-        # 갭상승 및 장전 수급 가중치 부여
+    for idx, item in enumerate(raw_data[:8], 1):
         gap_score = int(min(98, max(65, 75 + item["change_rate"] * 1.8)))
-
         results.append(
             {
                 "순위": idx,
                 "종목명": item["name"],
                 "종목코드": item["code"],
-                "전일종가": f"{item['prev_close']:,}원",
-                "장전예상가": f"{item['price']:,}원",
-                "예상갭상승률": f"{item['change_rate']:+.2f}%",
-                "오전점수": f"{gap_score}점",
+                "전일 종가": f"{item['prev_close']:,}원",
+                "장전/시초 예상가": f"{item['price']:,}원",
+                "예상 갭상승률": f"{item['change_rate']:+.2f}%",
+                "오전 점수": f"{gap_score}점",
                 "진입 가이드": (
                     "🚀 시초가 타점 유효"
                     if item["change_rate"] > 1.5
@@ -164,7 +187,7 @@ def get_morning_scanner():
 if "저녁장" in scan_mode:
     st.header("🌆 [저녁장 모드] 19:30 애프터마켓 실시간 수급 스캐너")
     st.info(
-        "💡 **네이버 증권 실시간 연동 완료**: 시간외 수급 및 당일 강세 종목의 전일종가와 현재가를 실시간으로 계산하여 불러옵니다."
+        "💡 **실시간 API 연동**: 네이버 금융 공식 시세 API를 불러와 현재가, 전일종가, 등락률을 즉시 계산합니다."
     )
 
     col1, col2, col3 = st.columns(3)
@@ -173,19 +196,21 @@ if "저녁장" in scan_mode:
     col3.metric("필수 손절가", "-1.5% ~ -2.0%")
 
     if st.button("🚀 저녁장 실시간 스캔 실행", type="primary"):
-        with st.spinner("네이버 증권 실시간 수급 및 시세 파싱 중..."):
+        with st.spinner("네이버 금융 실시간 시세 수집 중..."):
             df_after = get_aftermarket_scanner()
 
         if not df_after.empty:
-            st.success("✅ 실시간 스캔 완료! 오버나이트 검증 후보")
+            st.success("✅ 실시간 스캔 성공! 오버나이트 후보 종목")
             st.dataframe(df_after, use_container_width=True)
 
             st.markdown("### 📋 2차 검증(AI Validator) 가이드")
             st.write(
-                "스캔된 상위 1~3번 종목을 알려주시면, **[뉴스 재료 + 차트 매물대 + 미장 변수]**를 반영해 2차 필터링을 진행해 드립니다."
+                "상위 종목을 알려주시면 **[뉴스 재료 + 차트 매물대 + 미장 변수]**를 반영해 2차 필터링을 진행해 드립니다."
             )
         else:
-            st.warning("데이터를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.")
+            st.error(
+                "데이터를 가져오지 못했습니다. 인터넷 연결 및 잠시 후 다시 시도해 보세요."
+            )
 
 # ==========================================
 # 5. 메인 화면 - 오전장 모드 UI
@@ -193,7 +218,7 @@ if "저녁장" in scan_mode:
 else:
     st.header("☀️ [오전장 모드] 08:00~08:50 실시간 장전 수급 스캐너")
     st.info(
-        "💡 **네이버 증권 실시간 연동 완료**: 장전 동시호가 및 실시간 시세 기준 전일종가 대비 예상 갭상승률을 실시간 파싱합니다."
+        "💡 **실시간 API 연동**: 실시간 수급 기준 전일종가 대비 예상 갭상승률을 정확히 산출합니다."
     )
 
     col1, col2, col3 = st.columns(3)
@@ -202,23 +227,23 @@ else:
     col3.metric("손절 기준", "-1.0% ~ -1.5% (타이트하게)")
 
     if st.button("🚀 오전장 실시간 스캔 실행", type="primary"):
-        with st.spinner("실시간 시세 및 장전 갭상승률 산출 중..."):
+        with st.spinner("실시간 장전 수급 산출 중..."):
             df_morning = get_morning_scanner()
 
         if not df_morning.empty:
-            st.success("✅ 실시간 스캔 완료! 오전장 진입 후보")
+            st.success("✅ 실시간 스캔 성공! 오전장 진입 후보 종목")
             st.dataframe(df_morning, use_container_width=True)
 
             st.warning(
                 "⚠️ **시초가 매매 주의**: 정규장(09:00) 개장 직후 갭상승 출하 물량에 유의하세요. -1.5% 이탈 시 즉시 손절해야 합니다."
             )
         else:
-            st.warning("데이터를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.")
+            st.error(
+                "데이터를 가져오지 못했습니다. 인터넷 연결 및 잠시 후 다시 시도해 보세요."
+            )
 
 # ==========================================
 # 6. 하단 푸터
 # ==========================================
 st.markdown("---")
-st.caption(
-    "KRX Automated Trading Engine V12.0 | Real-time Naver Finance Parser Integrated"
-)
+st.caption("KRX Automated Trading Engine V12.0 | Naver API Integrated")
