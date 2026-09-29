@@ -1,249 +1,364 @@
-import datetime
-import FinanceDataReader as fdr
+from datetime import datetime
+import xml.etree.ElementTree as ET
 import pandas as pd
+import pytz
+import requests
 import streamlit as st
 
-# ==========================================
-# 1. 스트림릿 페이지 기본 설정
-# ==========================================
-st.set_page_config(
-    page_title="KRX 삼중 모드 실시간 주식 스캐너 V13.0",
-    page_icon="📈",
-    layout="wide",
-)
 
-st.title("⚡ KRX 삼중 모드(저녁/오전/현재장) 실시간 주식 스캐너 V13.0")
-st.markdown(
-    "**FDR 차단회피 엔진 연동** | 철저한 **-1.5% ~ -2% 손절 준수** 기준 1차 스캐닝 시스템입니다."
-)
-st.markdown("---")
-
-# ==========================================
-# 2. 사이드바 설정 및 리스크 관리
-# ==========================================
-st.sidebar.header("⚙️ 스캔 모드 선택")
-scan_mode = st.sidebar.radio(
-    "스캔 모드를 선택하세요",
-    [
-        "🔥 현재장 모드 (정규장 실시간 모멘텀/거래대금)",
-        "☀️ 오전장 모드 (08:00~08:50 장전/시초가 수급)",
-        "🌆 저녁장 모드 (19:30 애프터마켓/시간외)",
-    ],
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("🛡️ 리스크 관리 철칙")
-st.sidebar.error("• 원칙 손절가: -1.5% ~ -2.0% 준수")
-st.sidebar.warning("• 금요일/미장 변동성: 비중 50% 축소")
-st.sidebar.info("• 단타 실패 시 절대 스윙 전환 금지")
+def get_kst_now():
+    return datetime.now(pytz.timezone("Asia/Seoul"))
 
 
-# ==========================================
-# 3. 차단 회피형 시장 데이터 수집 함수
-# ==========================================
-@st.cache_data(ttl=30)
-def fetch_market_fdr():
-    """FinanceDataReader를 활용한 KRX 전종목 실시간 시세 파싱"""
+@st.cache_data(ttl=3600 * 4)
+def fetch_top_market_cap_stocks(market="ALL", limit=300):
+    """네이버 증권 API 기반 상위 종목 수집 (외부 모듈 오류 차단)"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
+    }
+
+    stocks = []
+    markets = []
+    if market in ["ALL", "KOSPI"]:
+        markets.append(("KOSPI", "KOSPI"))
+    if market in ["ALL", "KOSDAQ"]:
+        markets.append(("KOSDAQ", "KOSDAQ"))
+
+    pages_needed = max(1, limit // 50)
+
+    for m_name, m_code in markets:
+        for page in range(1, pages_needed + 1):
+            url = f"https://m.stock.naver.com/api/stocks/marketValue/{m_code}?page={page}&pageSize=50"
+            try:
+                res = requests.get(url, headers=headers, timeout=5)
+                if res.status_code == 200:
+                    data = res.json()
+                    item_list = data.get("stocks", [])
+                    if not item_list:
+                        break
+                    for item in item_list:
+                        code = item.get("itemCode", "")
+                        name = item.get("stockName", "")
+                        if code and name:
+                            stocks.append(
+                                {
+                                    "Code": code,
+                                    "Name": name,
+                                    "Market": m_name,
+                                }
+                            )
+            except Exception:
+                continue
+
+    unique_stocks = list({s["Code"]: s for s in stocks}.values())
+    return unique_stocks[:limit]
+
+
+def fetch_daily_chart_ohlcv(symbol, count=80):
+    """네이버 일봉 차트 파싱 및 지표 계산"""
+    url = f"https://fchart.stock.naver.com/sise.nhn?symbol={symbol}&timeframe=day&count={count}&requestType=0"
     try:
-        df_krx = fdr.StockListing("KRX")
+        res = requests.get(url, timeout=5)
+        root = ET.fromstring(res.text)
 
-        # 거래량 존재하는 종목 필터링
-        df_filtered = df_krx[df_krx["Volume"] > 0].copy()
+        chart_data = []
+        for item in root.findall(".//item"):
+            data_str = item.attrib.get("data", "")
+            if data_str:
+                parts = data_str.split("|")
+                if len(parts) >= 6:
+                    chart_data.append(
+                        {
+                            "Date": parts[0],
+                            "Open": int(parts[1]),
+                            "High": int(parts[2]),
+                            "Low": int(parts[3]),
+                            "Close": int(parts[4]),
+                            "Volume": int(parts[5]),
+                        }
+                    )
 
-        # 등락률 및 거래대금 기준 정렬
-        df_sorted = df_filtered.sort_values(
-            by="ChgRate", ascending=False
-        ).head(15)
+        df = pd.DataFrame(chart_data)
+        if df.empty:
+            return df
 
-        results = []
-        for _, row in df_sorted.iterrows():
-            code = str(row["Code"])
-            name = str(row["Name"])
-            price = int(row["Close"])
-            change_rate = float(row["ChgRate"]) * 100
+        df["MA5"] = df["Close"].rolling(window=5).mean()
+        df["MA20"] = df["Close"].rolling(window=20).mean()
+        df["MA60"] = df["Close"].rolling(window=60).mean()
+        df["Vol_MA5"] = df["Volume"].rolling(window=5).mean()
+        df["TradingValue"] = df["Close"] * df["Volume"]
 
-            prev_close = (
-                int(round(price / (1 + (change_rate / 100))))
-                if change_rate != -100
-                else price
-            )
-
-            results.append(
-                {
-                    "code": code,
-                    "name": name,
-                    "price": price,
-                    "prev_close": prev_close,
-                    "change_rate": change_rate,
-                    "volume": int(row["Volume"]),
-                }
-            )
-
-        return results
-    except Exception as e:
-        st.error(f"⚠️ 데이터 로딩 실패: {e}")
-        return []
-
-
-def get_realtime_scanner():
-    """현재 정규장 실시간 거래대금 및 돌파 후보 산출"""
-    raw_data = fetch_market_fdr()
-    if not raw_data:
+        return df
+    except Exception:
         return pd.DataFrame()
 
+
+def run_timeframe_scanner(market_choice, strategy_type, scan_limit):
+    stock_list = fetch_top_market_cap_stocks(
+        market=market_choice, limit=scan_limit
+    )
+
     results = []
-    for idx, item in enumerate(raw_data[:10], 1):
-        momentum_score = int(min(99, max(60, 70 + item["change_rate"] * 2)))
-        results.append(
-            {
-                "순위": idx,
-                "종목명": item["name"],
-                "종목코드": item["code"],
-                "현재가": f"{item['price']:,}원",
-                "전일 종가": f"{item['prev_close']:,}원",
-                "실시간 등락률": f"{item['change_rate']:+.2f}%",
-                "모멘텀 점수": f"{momentum_score}점",
-                "거래량": f"{item['volume']:,}주",
-                "진입 판단": (
-                    "🔥 강한 돌파"
-                    if item["change_rate"] > 3.0
-                    else "🟢 수급 유입"
-                ),
-            }
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    total_len = len(stock_list)
+
+    for i, stock_info in enumerate(stock_list):
+        code = stock_info["Code"]
+        name = stock_info["Name"]
+        market = stock_info["Market"]
+
+        status_text.text(
+            f"🔍 [{i+1}/{total_len}] 정밀 차트 지표 진단 중... {name}({code})"
         )
+        progress_bar.progress((i + 1) / total_len)
+
+        df_chart = fetch_daily_chart_ohlcv(code, count=80)
+
+        if len(df_chart) < 30:
+            continue
+
+        curr = df_chart.iloc[-1]
+        prev = df_chart.iloc[-2]
+
+        close_p = int(curr["Close"])
+        open_p = int(curr["Open"])
+        high_p = int(curr["High"])
+
+        trading_val_100m = round(int(curr["TradingValue"]) / 100_000_000)
+        rate = round(((close_p - prev["Close"]) / prev["Close"]) * 100, 2)
+        vol_ratio = (
+            round((curr["Volume"] / prev["Vol_MA5"]) * 100, 1)
+            if prev["Vol_MA5"] > 0
+            else 100.0
+        )
+
+        # -----------------------------------------------------------------
+        # B안 핵심: 차트 정밀 수치 진단 계산
+        # -----------------------------------------------------------------
+        # 1. 윗꼬리 비율 (고점 대비 밀린 폭)
+        wick_ratio = (
+            round(((high_p - close_p) / (high_p - open_p + 1e-5)) * 100, 1)
+            if high_p > open_p
+            else 0
+        )
+        # 2. 20일선 이격도
+        ma20_gap = round(((close_p - curr["MA20"]) / curr["MA20"]) * 100, 1)
+
+        # 3. 종합 진단 등급 판정
+        if wick_ratio > 45.0 or ma20_gap > 12.0:
+            diag_grade = "🔴 유의 (차익매물/과열)"
+            diag_desc = "고점 차익실현 매물 압박이 있거나 이격도가 높음"
+        elif wick_ratio > 25.0 or ma20_gap > 7.0:
+            diag_grade = "🟡 관망 (타점 주시)"
+            diag_desc = "20일선 부근 안정적 분할 접근 권장"
+        else:
+            diag_grade = "🟢 진입 유효 (양호)"
+            diag_desc = "손익비 위치 우수 및 차트 파동 양호"
+
+        # -----------------------------------------------------------------
+        # 전략별 스캔 및 포착
+        # -----------------------------------------------------------------
+        if strategy_type == "morning":
+            gap_rate = round(
+                ((open_p - prev["Close"]) / prev["Close"]) * 100, 2
+            )
+            if 1.5 <= gap_rate <= 6.5 and close_p >= open_p and vol_ratio >= 150:
+                stop_loss = int(open_p * 0.98)
+                target_p = int(close_p * 1.045)
+                risk = close_p - stop_loss
+                reward = target_p - close_p
+                rr_ratio = round(reward / risk, 2) if risk > 0 else 0
+
+                results.append(
+                    {
+                        "시장": market,
+                        "종목명": name,
+                        "종목코드": code,
+                        "현재가": f"{close_p:,}원",
+                        "등락률": f"{rate:+.2f}%",
+                        "시가 갭률": f"{gap_rate:+.2f}%",
+                        "거래량 폭발비": f"{vol_ratio:.0f}%",
+                        "차트 진단 등급": diag_grade,
+                        "윗꼬리 비율": f"{wick_ratio:.1f}%",
+                        "20일선 이격도": f"{ma20_gap:+.1f}%",
+                        "🎯 1차 목표가": f"{target_p:,}원",
+                        "🛡️ 손절 기준가": f"{stop_loss:,}원",
+                        "손익비 (R:R)": f"1 : {rr_ratio}",
+                        "진단 요약": diag_desc,
+                    }
+                )
+
+        elif strategy_type == "intraday":
+            is_breakout = (
+                close_p > open_p
+                and curr["Close"] > curr["MA20"]
+                and prev["Close"] <= prev["MA20"]
+            )
+            is_aligned_pullback = (
+                curr["MA5"] > curr["MA20"] > curr["MA60"]
+                and abs((close_p - curr["MA20"]) / curr["MA20"]) <= 0.02
+            )
+
+            if trading_val_100m >= 100 and (
+                is_breakout or is_aligned_pullback
+            ):
+                stop_loss = (
+                    int(open_p * 0.97)
+                    if is_breakout
+                    else int(curr["MA20"] * 0.98)
+                )
+                target_p = int(close_p * 1.06)
+                risk = close_p - stop_loss
+                reward = target_p - close_p
+                rr_ratio = round(reward / risk, 2) if risk > 0 else 0
+
+                results.append(
+                    {
+                        "시장": market,
+                        "종목명": name,
+                        "종목코드": code,
+                        "현재가": f"{close_p:,}원",
+                        "등락률": f"{rate:+.2f}%",
+                        "추정 거래대금": f"{trading_val_100m:,}억원",
+                        "차트 진단 등급": diag_grade,
+                        "윗꼬리 비율": f"{wick_ratio:.1f}%",
+                        "20일선 이격도": f"{ma20_gap:+.1f}%",
+                        "🎯 1차 목표가": f"{target_p:,}원",
+                        "🛡️ 손절 기준가": f"{stop_loss:,}원",
+                        "손익비 (R:R)": f"1 : {rr_ratio}",
+                        "진단 요약": diag_desc,
+                    }
+                )
+
+        elif strategy_type == "overnight":
+            if (
+                2.0 <= rate <= 8.0
+                and close_p > open_p
+                and curr["Close"] > curr["MA5"]
+            ):
+                stop_loss = int(curr["MA5"] * 0.985)
+                target_p = int(close_p * 1.05)
+                risk = close_p - stop_loss
+                reward = target_p - close_p
+                rr_ratio = round(reward / risk, 2) if risk > 0 else 0
+
+                results.append(
+                    {
+                        "시장": market,
+                        "종목명": name,
+                        "종목코드": code,
+                        "현재가": f"{close_p:,}원",
+                        "당일 등락률": f"{rate:+.2f}%",
+                        "추정 거래대금": f"{trading_val_100m:,}억원",
+                        "차트 진단 등급": diag_grade,
+                        "윗꼬리 비율": f"{wick_ratio:.1f}%",
+                        "20일선 이격도": f"{ma20_gap:+.1f}%",
+                        "🎯 1차 목표가": f"{target_p:,}원",
+                        "🛡️ 손절 기준가": f"{stop_loss:,}원",
+                        "손익비 (R:R)": f"1 : {rr_ratio}",
+                        "진단 요약": diag_desc,
+                    }
+                )
+
+    progress_bar.empty()
+    status_text.empty()
     return pd.DataFrame(results)
 
 
-def get_aftermarket_scanner():
-    """저녁장(19:30) 시간외 및 오버나이트 후보 산출"""
-    raw_data = fetch_market_fdr()
-    if not raw_data:
-        return pd.DataFrame()
-
-    results = []
-    for idx, item in enumerate(raw_data[:8], 1):
-        score = int(min(99, max(60, 70 + item["change_rate"] * 2)))
-        results.append(
-            {
-                "순위": idx,
-                "종목명": item["name"],
-                "종목코드": item["code"],
-                "실시간 현재가": f"{item['price']:,}원",
-                "전일 종가": f"{item['prev_close']:,}원",
-                "시간외 등락률": f"{item['change_rate']:+.2f}%",
-                "수급 점수": f"{score}점",
-                "상태": (
-                    "🟢 수급 양호"
-                    if item["change_rate"] > 0
-                    else "🟡 관망 필요"
-                ),
-            }
-        )
-    return pd.DataFrame(results)
-
-
-def get_morning_scanner():
-    """오전장(08:00~08:50) 장전 갭상승 후보 산출"""
-    raw_data = fetch_market_fdr()
-    if not raw_data:
-        return pd.DataFrame()
-
-    results = []
-    for idx, item in enumerate(raw_data[:8], 1):
-        gap_score = int(min(98, max(65, 75 + item["change_rate"] * 1.8)))
-        results.append(
-            {
-                "순위": idx,
-                "종목명": item["name"],
-                "종목코드": item["code"],
-                "전일 종가": f"{item['prev_close']:,}원",
-                "장전/시초 예상가": f"{item['price']:,}원",
-                "예상 갭상승률": f"{item['change_rate']:+.2f}%",
-                "오전 점수": f"{gap_score}점",
-                "진입 가이드": (
-                    "🚀 시초가 타점 유효"
-                    if item["change_rate"] > 1.5
-                    else "⚠️ 갭미달/주의"
-                ),
-            }
-        )
-    return pd.DataFrame(results)
-
-
-# ==========================================
-# 4. 메인 화면 - 1) 현재장 모드 UI
-# ==========================================
-if "현재장" in scan_mode:
-    st.header("🔥 [현재장 모드] 정규장 실시간 모멘텀 & 수급 스캐너")
-    st.info(
-        "💡 **전략 안내**: 현재 주식 시장에서 실시간으로 거래대금과 수급이 몰리는 상위 종목을 포착합니다."
+def main():
+    st.set_page_config(
+        page_title="정밀 차트 진단 & 손익분기 매매 스캐너", layout="wide"
     )
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("권장 스캔 시간", "09:00 ~ 15:30 정규장")
-    col2.metric("목표 익절가", "+2.0% ~ +4.0%")
-    col3.metric("필수 손절가", "-1.5% ~ -2.0%")
-
-    if st.button("🚀 현재장 실시간 모멘텀 스캔 실행", type="primary"):
-        with st.spinner("KRX 실시간 체결 시세 조회 중..."):
-            df_now = get_realtime_scanner()
-
-        if not df_now.empty:
-            st.success("✅ 실시간 스캔 성공! 현재 모멘텀 상위 종목")
-            st.dataframe(df_now, use_container_width=True)
-            st.caption(
-                "※ 스캔 결과 상위 종목을 AI에게 알려주시면 차트 매물대 및 뉴스 악재 여부를 2차 판정해 드립니다."
-            )
-        else:
-            st.error("데이터 수집에 실패했습니다. 잠시 후 시도해 보세요.")
-
-# ==========================================
-# 5. 메인 화면 - 2) 오전장 모드 UI
-# ==========================================
-elif "오전장" in scan_mode:
-    st.header("☀️ [오전장 모드] 08:00~08:50 실시간 장전 수급 스캐너")
-    st.info(
-        "💡 **전략 안내**: 장전 동시호가 및 실시간 갭상승 유효 종목을 파악하여 시초가 단타 타점에 활용합니다."
+    st.title("📈 B안: 정밀 차트 수치 진단 & 손익분기점(R:R) 스캐너")
+    st.caption(
+        "외부 차트 라이브러리 설치 없이 윗꼬리 비율, 20일선 이격도, 수급 과열 진단 리포트를 안전하게 제공합니다."
     )
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("권장 스캔 시간", "08:10 ~ 08:45")
-    col2.metric("미장 연동 점검", "나스닥 / 엔비디아 등")
-    col3.metric("손절 기준", "-1.0% ~ -1.5% (타이트하게)")
-
-    if st.button("🚀 오전장 실시간 스캔 실행", type="primary"):
-        with st.spinner("장전 수급 데이터 수집 중..."):
-            df_morning = get_morning_scanner()
-
-        if not df_morning.empty:
-            st.success("✅ 실시간 스캔 성공! 오전장 진입 후보 종목")
-            st.dataframe(df_morning, use_container_width=True)
-        else:
-            st.error("데이터 수집에 실패했습니다. 잠시 후 시도해 보세요.")
-
-# ==========================================
-# 6. 메인 화면 - 3) 저녁장 모드 UI
-# ==========================================
-else:
-    st.header("🌆 [저녁장 모드] 19:30 애프터마켓 실시간 수급 스캐너")
-    st.info(
-        "💡 **전략 안내**: 시간외 수급 우상향 종목을 파악하여 다음 날 아침 갭상승 오버나이트 타점을 포착합니다."
+    st.sidebar.header("⚙️ 스캔 범위 설정")
+    market_choice = st.sidebar.radio(
+        "분석 시장 선택", ["ALL (코스피+코스닥)", "KOSPI", "KOSDAQ"], index=0
     )
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("권장 스캔 시간", "19:30 ~ 19:50")
-    col2.metric("목표 익절가", "+1.5% ~ +2.5%")
-    col3.metric("필수 손절가", "-1.5% ~ -2.0%")
+    m_code = (
+        "ALL"
+        if "ALL" in market_choice
+        else ("KOSPI" if "KOSPI" in market_choice else "KOSDAQ")
+    )
 
-    if st.button("🚀 저녁장 실시간 스캔 실행", type="primary"):
-        with st.spinner("시간외 시세 데이터 파싱 중..."):
-            df_after = get_aftermarket_scanner()
+    scan_limit = st.sidebar.slider(
+        "분석할 시가총액 상위 종목 수",
+        min_value=50,
+        max_value=500,
+        value=200,
+        step=50,
+    )
 
-        if not df_after.empty:
-            st.success("✅ 실시간 스캔 성공! 오버나이트 후보 종목")
-            st.dataframe(df_after, use_container_width=True)
-        else:
-            st.error("데이터 수집에 실패했습니다. 잠시 후 시도해 보세요.")
+    tab1, tab2, tab3 = st.tabs(
+        [
+            "⚡ 1. 오전 단타 탐색 (08:30~10:00)",
+            "☀️ 2. 장중 주도주 탐색 (10:00~14:30)",
+            "🌙 3. 마감장 종가베팅 (15:00~)",
+        ]
+    )
 
-st.markdown("---")
-st.caption("KRX Automated Trading Engine V13.0")
+    tab_configs = [
+        (tab1, "morning", "btn_m", "⚡ 오전 단타"),
+        (tab2, "intraday", "btn_i", "☀️ 장중 주도주"),
+        (tab3, "overnight", "btn_o", "🌙 마감장 종가베팅"),
+    ]
+
+    for tab, strat_key, btn_key, title_str in tab_configs:
+        with tab:
+            st.subheader(f"{title_str} 조건 정밀 진단 스캔")
+            if st.button(f"🚀 {title_str} 스캔 및 진단 실행", key=btn_key):
+                with st.spinner("차트 파동 수치 및 진단 리포트 산출 중..."):
+                    st.session_state[f"res_{strat_key}"] = (
+                        run_timeframe_scanner(m_code, strat_key, scan_limit)
+                    )
+
+            df_res = st.session_state.get(f"res_{strat_key}", pd.DataFrame())
+
+            if not df_res.empty:
+                st.success(
+                    f"✅ 분석 완료: 총 {len(df_res)}개 종목이 포착 및 정밀 진단되었습니다."
+                )
+                st.dataframe(df_res, use_container_width=True)
+
+                st.markdown("---")
+                st.subheader("📋 선택 종목 기술적 심층 진단")
+
+                stock_options = [
+                    f"{row['종목명']} ({row['종목코드']})"
+                    for _, row in df_res.iterrows()
+                ]
+                selected_stock = st.selectbox(
+                    "상세 진단을 조회할 종목을 선택하세요:",
+                    stock_options,
+                    key=f"select_{strat_key}",
+                )
+
+                if selected_stock:
+                    sel_code = selected_stock.split("(")[1].replace(")", "")
+                    row_info = df_res[df_res["종목코드"] == sel_code].iloc[0]
+
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("차트 진단 등급", row_info["차트 진단 등급"])
+                    col2.metric("20일선 이격도", row_info["20일선 이격도"])
+                    col3.metric("당일 윗꼬리 비율", row_info["윗꼬리 비율"])
+                    col4.metric("손익비 (R:R)", row_info["손익비 (R:R)"])
+
+                    st.info(
+                        f"💡 **[{row_info['종목명']}] 진단 리포트:** {row_info['진단 요약']} "
+                        f"(목표가: {row_info['🎯 1차 목표가']} / 손절가: {row_info['🛡️ 손절 기준가']})"
+                    )
+            else:
+                st.info(
+                    "스캔 버튼을 눌러 조건 부합 종목 및 진단 결과를 확인하세요."
+                )
+
+
+if __name__ == "__main__":
+    main()
