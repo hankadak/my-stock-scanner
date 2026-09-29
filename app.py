@@ -103,79 +103,69 @@ class KBSecuritiesScannerEngine:
             return {"success": False, "reason": str(e)}
 
 
-@st.cache_data(ttl=3600 * 12)
-def load_all_stocks_from_krx(market_choice="ALL"):
-    """외부 패키지 없이 네이버 API로 코스피/코스닥 전종목 자동 수집"""
+@st.cache_data(ttl=3600 * 6)
+def get_naver_market_stocks(market_type="ALL", pages_per_market=5):
+    """네이버 증권 시가총액 순위에서 코스피/코스닥 종목 수집"""
     stocks = []
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
 
-    # 네이버 증권 전종목 페이지 수집 (1: KOSPI, 2: KOSDAQ)
-    markets = []
-    if market_choice in ["ALL", "KOSPI"]:
-        markets.append(("KOSPI", 0))
-    if market_choice in ["ALL", "KOSDAQ"]:
-        markets.append(("KOSDAQ", 1))
+    targets = []
+    if market_type in ["ALL", "KOSPI"]:
+        targets.append(("KOSPI", 0))
+    if market_type in ["ALL", "KOSDAQ"]:
+        targets.append(("KOSDAQ", 1))
 
-    for m_name, m_code in markets:
-        for page in range(1, 15):  # 주요 상위종목 수집
-            url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={m_code}&page={page}"
+    for m_name, sosok in targets:
+        for page in range(1, pages_per_market + 1):
+            url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
             try:
                 res = requests.get(url, headers=headers, timeout=5)
-                dfs = pd.read_html(res.text, encoding="euc-kr")
-                if dfs:
-                    df = dfs[1].dropna(how="all")
-                    df = df[
-                        df["N"].notnull() & (df["종목명"] != "카카오페이")
-                    ]  # 유효 데이터만
+                # BeautifulSoup 대신 pandas read_html 사용
+                tables = pd.read_html(res.text, encoding="euc-kr")
+                if len(tables) > 1:
+                    df = tables[1].dropna(how="all")
+                    # href 속성을 가져오기 위해 raw HTML 파싱 추가
+                    from bs4 import BeautifulSoup
 
-                    for _, row in df.iterrows():
-                        name = str(row["종목명"]).strip()
-                        # 종목 코드 파싱
-                        href_str = str(row)
-                        if "N" in row and not pd.isna(row["N"]):
-                            # 코드는 네이버 페이지 테이블 인덱스에서 매핑
-                            pass
+                    soup = BeautifulSoup(res.text, "html.parser")
+                    title_tags = soup.select("a.tltb")
+
+                    for tag in title_tags:
+                        href = tag.get("href", "")
+                        if "code=" in href:
+                            code = href.split("code=")[-1]
+                            name = tag.text.strip()
+                            if code and name:
+                                stocks.append(
+                                    {
+                                        "Code": code,
+                                        "Name": name,
+                                        "Market": m_name,
+                                    }
+                                )
             except Exception:
-                break
+                continue
 
-    # 기본 백업 종목군 (네이버 파싱 대비 안정망)
-    fallback_universe = [
-        {"Code": "005930", "Name": "삼성전자", "Market": "KOSPI"},
-        {"Code": "000660", "Name": "SK하이닉스", "Market": "KOSPI"},
-        {"Code": "373220", "Name": "LG에너지솔루션", "Market": "KOSPI"},
-        {"Code": "207940", "Name": "삼성바이오로직스", "Market": "KOSPI"},
-        {"Code": "005935", "Name": "삼성전자우", "Market": "KOSPI"},
-        {"Code": "000270", "Name": "기아", "Market": "KOSPI"},
-        {"Code": "005490", "Name": "POSCO홀딩스", "Market": "KOSPI"},
-        {"Code": "035720", "Name": "카카오", "Market": "KOSPI"},
-        {"Code": "247540", "Name": "에코프로비엠", "Market": "KOSDAQ"},
-        {"Code": "086520", "Name": "에코프로", "Market": "KOSDAQ"},
-        {"Code": "068270", "Name": "셀트리온", "Market": "KOSPI"},
-        {"Code": "035420", "Name": "NAVER", "Market": "KOSPI"},
-        {"Code": "105560", "Name": "KB금융", "Market": "KOSPI"},
-        {"Code": "055550", "Name": "신한지주", "Market": "KOSPI"},
-        {"Code": "003550", "Name": "LG", "Market": "KOSPI"},
-        {"Code": "015760", "Name": "한국전력", "Market": "KOSPI"},
-        {"Code": "032830", "Name": "삼성생명", "Market": "KOSPI"},
-        {"Code": "018260", "Name": "삼성SDS", "Market": "KOSPI"},
-        {"Code": "009150", "Name": "삼성전기", "Market": "KOSPI"},
-        {"Code": "010140", "Name": "삼성중공업", "Market": "KOSPI"},
-    ]
-
-    if market_choice == "KOSPI":
-        return [s for s in fallback_universe if s["Market"] == "KOSPI"]
-    elif market_choice == "KOSDAQ":
-        return [s for s in fallback_universe if s["Market"] == "KOSDAQ"]
-
-    return fallback_universe
+    # 중복 제거
+    unique_stocks = list({s["Code"]: s for s in stocks}.values())
+    return unique_stocks
 
 
 def get_kst_now():
     return datetime.now(pytz.timezone("Asia/Seoul")).strftime("%H:%M:%S")
 
 
-def run_scanner(scanner, strategy_type, market_choice):
-    stock_list = load_all_stocks_from_krx(market_choice)
+def run_scanner(scanner, strategy_type, market_choice, max_scan_count):
+    # 페이지 수 계산 (페이지당 50종목)
+    pages_needed = max(1, max_scan_count // 50)
+    stock_list = get_naver_market_stocks(
+        market_choice, pages_per_market=pages_needed
+    )
+
+    if max_scan_count > 0:
+        stock_list = stock_list[:max_scan_count]
 
     results = []
     progress_bar = st.progress(0)
@@ -238,7 +228,7 @@ def run_scanner(scanner, strategy_type, market_choice):
                 }
             )
 
-        time.sleep(0.05)  # API 제한 방지
+        time.sleep(0.05)  # API 과호출 제한 준수 (초당 20건 제한 고려)
 
     progress_bar.empty()
     status_text.empty()
@@ -258,7 +248,7 @@ def main():
             "⚠️ Streamlit Secrets에 KB_APPKEY와 KB_APPSECRET을 올바르게 등록해 주세요."
         )
 
-    st.sidebar.header("⚙️ 스캔 대상 선택")
+    st.sidebar.header("⚙️ 스캔 범위 설정")
     market_choice = st.sidebar.radio(
         "시장 선택",
         ["ALL (코스피+코스닥)", "KOSPI", "KOSDAQ"],
@@ -272,6 +262,16 @@ def main():
     else:
         m_code = "KOSDAQ"
 
+    # 스캔 종목 수 설정 슬라이더
+    max_scan_count = st.sidebar.slider(
+        "스캔할 종목 수 선택",
+        min_value=50,
+        max_value=1000,
+        value=100,
+        step=50,
+        help="종목 수가 많을수록 스캔에 시간이 더 걸립니다 (100종목당 약 5초 소요).",
+    )
+
     tab1, tab2, tab3 = st.tabs(
         [
             "🌅 1. 오전장 시작 전 탐색 (08:30~09:00)",
@@ -284,7 +284,9 @@ def main():
         st.subheader("🌅 장 시작 전 / 장초반 갭상승 예상 종목 스캔")
         if st.button("🚀 장전 스캔 실행", key="btn_m"):
             with st.spinner("장전 시세 스캔 중..."):
-                data = run_scanner(scanner, "morning", m_code)
+                data = run_scanner(
+                    scanner, "morning", m_code, max_scan_count
+                )
             st.success(
                 f"✅ 동기화 완료 ({get_kst_now()}) - 총 {len(data)}개 종목 분석 완료"
             )
@@ -294,7 +296,9 @@ def main():
         st.subheader("☀️ 장중 돌파 및 수급 급증 주도주 스캔")
         if st.button("🚀 장중 주도주 스캔 실행", key="btn_i"):
             with st.spinner("장중 수급 스캔 중..."):
-                data = run_scanner(scanner, "intraday", m_code)
+                data = run_scanner(
+                    scanner, "intraday", m_code, max_scan_count
+                )
             st.success(
                 f"✅ 동기화 완료 ({get_kst_now()}) - 총 {len(data)}개 종목 분석 완료"
             )
@@ -304,7 +308,9 @@ def main():
         st.subheader("🌙 종가 베팅 (장마감 전 매수 ➔ 다음 날 시가/장초반 매도)")
         if st.button("🚀 종가 베팅 스캔 실행", key="btn_o"):
             with st.spinner("종가 베팅 분석 중..."):
-                data = run_scanner(scanner, "overnight", m_code)
+                data = run_scanner(
+                    scanner, "overnight", m_code, max_scan_count
+                )
             st.success(
                 f"✅ 동기화 완료 ({get_kst_now()}) - 총 {len(data)}개 종목 분석 완료"
             )
