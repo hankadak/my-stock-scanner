@@ -13,7 +13,6 @@ class KBSecuritiesScannerEngine:
         self.appkey = raw_key.strip()
         self.appsecret = raw_secret.strip()
 
-        # KB증권 단일 통합 도메인
         self.base_url = "https://openapi.kbsec.com"
         self.access_token = ""
         self.last_error = ""
@@ -25,9 +24,9 @@ class KBSecuritiesScannerEngine:
             )
             return False
 
-        # KB증권 표준 인증
-        path = "/oauth2/tokenP"
-        headers = {"content-type": "application/x-www-form-urlencoded"}
+        # KB증권 토큰 발급
+        path = "/oauth2/token"
+        headers = {"content-type": "application/json; charset=UTF-8"}
         body = {
             "grant_type": "client_credentials",
             "appkey": self.appkey,
@@ -36,15 +35,16 @@ class KBSecuritiesScannerEngine:
 
         try:
             res = requests.post(
-                f"{self.base_url}{path}", headers=headers, data=body, timeout=10
+                f"{self.base_url}{path}", headers=headers, json=body, timeout=10
             )
 
             try:
                 data = res.json()
             except Exception:
-                text_preview = res.text[:80].replace("\n", " ")
+                # JSON 변환 실패 시 HTML 내용 80자 출력
+                preview = res.text[:80].replace("\n", " ").replace("\r", "")
                 self.last_error = (
-                    f"KB 서버 응답 형식 오류 (상태:{res.status_code})"
+                    f"토큰응답오류({res.status_code}): {preview}"
                 )
                 return False
 
@@ -56,9 +56,9 @@ class KBSecuritiesScannerEngine:
                     "error_description",
                     data.get("msg1", data.get("message", "인증 실패")),
                 )
-                self.last_error = f"KB 인증 에러: {err_msg}"
+                self.last_error = f"KB인증실패: {err_msg}"
         except Exception as e:
-            self.last_error = f"통신 네트워크 에러: {str(e)}"
+            self.last_error = f"통신에러: {str(e)}"
 
         return False
 
@@ -67,6 +67,7 @@ class KBSecuritiesScannerEngine:
             if not self.get_access_token():
                 return {"success": False, "reason": self.last_error}
 
+        # 시세 조회 경로
         path_price = "/uapi/domestic-stock/v1/quotations/inquire-price"
         headers = {
             "content-type": "application/json; charset=utf-8",
@@ -87,25 +88,51 @@ class KBSecuritiesScannerEngine:
                 params=params_price,
                 timeout=10,
             )
-            if res.status_code == 200:
+
+            try:
                 data = res.json()
-                out = data.get("output", {})
-                return {
-                    "success": True,
-                    "name": out.get("hts_kor_isnm", ""),
-                    "close": int(out.get("stck_sdpr", 0)),
-                    "price": int(out.get("stck_prpr", 0)),
-                    "power": float(out.get("hts_avls", 0.0)),
-                    "rate": float(out.get("prdy_vrss_rt", 0.0)),
-                    "volume": int(out.get("acml_vol", 0)),
-                }
-            else:
+            except Exception:
+                preview = res.text[:80].replace("\n", " ").replace("\r", "")
                 return {
                     "success": False,
-                    "reason": f"시세조회 응답 오류 ({res.status_code})",
+                    "reason": f"시세응답HTML({res.status_code}): {preview}",
+                }
+
+            if res.status_code == 200:
+                # KB/한국투자 공통 API 포맷 지원
+                out = data.get("output", {}) or data.get("output1", {})
+                if not out and "stck_prpr" in data:
+                    out = data
+
+                if out:
+                    price = int(out.get("stck_prpr", 0))
+                    rate = float(out.get("prdy_vrss_rt", 0.0))
+                    power = float(out.get("hts_avls", 0.0))
+                    volume = int(out.get("acml_vol", 0))
+                    name = out.get("hts_kor_isnm", "")
+
+                    return {
+                        "success": True,
+                        "name": name,
+                        "price": price,
+                        "power": power,
+                        "rate": rate,
+                        "volume": volume,
+                    }
+                else:
+                    msg = data.get("msg1", data.get("message", "데이터 없음"))
+                    return {
+                        "success": False,
+                        "reason": f"시세데이터없음: {msg}",
+                    }
+            else:
+                msg = data.get("msg1", "응답 오류")
+                return {
+                    "success": False,
+                    "reason": f"시세조회실패({res.status_code}): {msg}",
                 }
         except Exception as e:
-            return {"success": False, "reason": f"데이터 통신 에러: {str(e)}"}
+            return {"success": False, "reason": f"통신예외: {str(e)}"}
 
     def scan_by_strategy(self, strategy_type: str) -> list:
         universe = [
@@ -184,7 +211,7 @@ class KBSecuritiesScannerEngine:
                         "종목코드": code,
                         "현재가": "연동 실패",
                         "등락률": "-",
-                        "체결강도": f"오류: {reason}",
+                        "체결강도": f"{reason}",
                         "거래량": "-",
                         "전략 포착 신호": "🔴 데이터 수신 불가",
                         "매매 판단": "ERROR",
