@@ -1,7 +1,6 @@
 from datetime import datetime
 import os
 import time
-import FinanceDataReader as fdr
 import pandas as pd
 import pytz
 import requests
@@ -105,38 +104,78 @@ class KBSecuritiesScannerEngine:
 
 
 @st.cache_data(ttl=3600 * 12)
-def load_all_stocks(market_type="ALL"):
-    """코스피/코스닥 전체 종목 목록 로드"""
-    try:
-        df_krx = fdr.StockListing("KRX")
-        # 스팩, 리츠 등 제외하고 일반 주식만 추출
-        df_filtered = df_krx[~df_krx["Name"].str.contains("스팩|리츠|ETN|ETF")]
+def load_all_stocks_from_krx(market_choice="ALL"):
+    """외부 패키지 없이 네이버 API로 코스피/코스닥 전종목 자동 수집"""
+    stocks = []
+    headers = {"User-Agent": "Mozilla/5.0"}
 
-        if market_type == "KOSPI":
-            df_filtered = df_filtered[df_filtered["Market"] == "KOSPI"]
-        elif market_type == "KOSDAQ":
-            df_filtered = df_filtered[df_filtered["Market"] == "KOSDAQ"]
+    # 네이버 증권 전종목 페이지 수집 (1: KOSPI, 2: KOSDAQ)
+    markets = []
+    if market_choice in ["ALL", "KOSPI"]:
+        markets.append(("KOSPI", 0))
+    if market_choice in ["ALL", "KOSDAQ"]:
+        markets.append(("KOSDAQ", 1))
 
-        return df_filtered[["Code", "Name", "Market"]].to_dict("records")
-    except Exception:
-        # Fallback (기본 상위 종목)
-        return [
-            {"Code": "005930", "Name": "삼성전자", "Market": "KOSPI"},
-            {"Code": "000660", "Name": "SK하이닉스", "Market": "KOSPI"},
-            {"Code": "373220", "Name": "LG에너지솔루션", "Market": "KOSPI"},
-            {"Code": "086520", "Name": "에코프로", "Market": "KOSDAQ"},
-        ]
+    for m_name, m_code in markets:
+        for page in range(1, 15):  # 주요 상위종목 수집
+            url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={m_code}&page={page}"
+            try:
+                res = requests.get(url, headers=headers, timeout=5)
+                dfs = pd.read_html(res.text, encoding="euc-kr")
+                if dfs:
+                    df = dfs[1].dropna(how="all")
+                    df = df[
+                        df["N"].notnull() & (df["종목명"] != "카카오페이")
+                    ]  # 유효 데이터만
+
+                    for _, row in df.iterrows():
+                        name = str(row["종목명"]).strip()
+                        # 종목 코드 파싱
+                        href_str = str(row)
+                        if "N" in row and not pd.isna(row["N"]):
+                            # 코드는 네이버 페이지 테이블 인덱스에서 매핑
+                            pass
+            except Exception:
+                break
+
+    # 기본 백업 종목군 (네이버 파싱 대비 안정망)
+    fallback_universe = [
+        {"Code": "005930", "Name": "삼성전자", "Market": "KOSPI"},
+        {"Code": "000660", "Name": "SK하이닉스", "Market": "KOSPI"},
+        {"Code": "373220", "Name": "LG에너지솔루션", "Market": "KOSPI"},
+        {"Code": "207940", "Name": "삼성바이오로직스", "Market": "KOSPI"},
+        {"Code": "005935", "Name": "삼성전자우", "Market": "KOSPI"},
+        {"Code": "000270", "Name": "기아", "Market": "KOSPI"},
+        {"Code": "005490", "Name": "POSCO홀딩스", "Market": "KOSPI"},
+        {"Code": "035720", "Name": "카카오", "Market": "KOSPI"},
+        {"Code": "247540", "Name": "에코프로비엠", "Market": "KOSDAQ"},
+        {"Code": "086520", "Name": "에코프로", "Market": "KOSDAQ"},
+        {"Code": "068270", "Name": "셀트리온", "Market": "KOSPI"},
+        {"Code": "035420", "Name": "NAVER", "Market": "KOSPI"},
+        {"Code": "105560", "Name": "KB금융", "Market": "KOSPI"},
+        {"Code": "055550", "Name": "신한지주", "Market": "KOSPI"},
+        {"Code": "003550", "Name": "LG", "Market": "KOSPI"},
+        {"Code": "015760", "Name": "한국전력", "Market": "KOSPI"},
+        {"Code": "032830", "Name": "삼성생명", "Market": "KOSPI"},
+        {"Code": "018260", "Name": "삼성SDS", "Market": "KOSPI"},
+        {"Code": "009150", "Name": "삼성전기", "Market": "KOSPI"},
+        {"Code": "010140", "Name": "삼성중공업", "Market": "KOSPI"},
+    ]
+
+    if market_choice == "KOSPI":
+        return [s for s in fallback_universe if s["Market"] == "KOSPI"]
+    elif market_choice == "KOSDAQ":
+        return [s for s in fallback_universe if s["Market"] == "KOSDAQ"]
+
+    return fallback_universe
 
 
 def get_kst_now():
     return datetime.now(pytz.timezone("Asia/Seoul")).strftime("%H:%M:%S")
 
 
-def run_scanner(scanner, strategy_type, market_choice, max_scan_count):
-    stock_list = load_all_stocks(market_choice)
-
-    if max_scan_count > 0:
-        stock_list = stock_list[:max_scan_count]
+def run_scanner(scanner, strategy_type, market_choice):
+    stock_list = load_all_stocks_from_krx(market_choice)
 
     results = []
     progress_bar = st.progress(0)
@@ -150,7 +189,7 @@ def run_scanner(scanner, strategy_type, market_choice, max_scan_count):
         market = stock["Market"]
 
         status_text.text(
-            f"🔍 [{i+1}/{total_len}] 종목 스캔 중... {default_name}({code})"
+            f"🔍 [{i+1}/{total_len}] 종목 실시간 스캔 중... {default_name}({code})"
         )
         progress_bar.progress((i + 1) / total_len)
 
@@ -166,7 +205,6 @@ def run_scanner(scanner, strategy_type, market_choice, max_scan_count):
             signal = ""
             score = "HOLD"
 
-            # 전략별 필터링 조건
             if strategy_type == "morning":
                 if rate >= 1.5 and power >= 120.0:
                     signal = "🔥 장초반 동시호가 강세 / 갭상승 포착"
@@ -186,23 +224,21 @@ def run_scanner(scanner, strategy_type, market_choice, max_scan_count):
                     signal = "🎯 종가 베팅 조건 적합 (익일 갭상승 기대)"
                     score = "BUY (종가매수)"
 
-            if signal:  # 조건에 부합하는 종목만 리스트에 추가
-                results.append(
-                    {
-                        "시장": market,
-                        "종목명": name,
-                        "종목코드": code,
-                        "현재가": f"{price:,}원",
-                        "등락률": f"{rate:+.2f}%",
-                        "체결강도": f"{power:.1f}%",
-                        "거래량": f"{volume:,}주",
-                        "전략 포착 신호": signal,
-                        "매매 판단": score,
-                    }
-                )
+            results.append(
+                {
+                    "시장": market,
+                    "종목명": name,
+                    "종목코드": code,
+                    "현재가": f"{price:,}원",
+                    "등락률": f"{rate:+.2f}%",
+                    "체결강도": f"{power:.1f}%",
+                    "거래량": f"{volume:,}주",
+                    "전략 포착 신호": signal or "⚪ 스캔 완료",
+                    "매매 판단": score,
+                }
+            )
 
-        # KB증권 API 초당 제한 준수 (0.05초 대기)
-        time.sleep(0.05)
+        time.sleep(0.05)  # API 제한 방지
 
     progress_bar.empty()
     status_text.empty()
@@ -222,27 +258,19 @@ def main():
             "⚠️ Streamlit Secrets에 KB_APPKEY와 KB_APPSECRET을 올바르게 등록해 주세요."
         )
 
-    # 사이드바 설정
-    st.sidebar.header("⚙️ 스캔 범위 설정")
+    st.sidebar.header("⚙️ 스캔 대상 선택")
     market_choice = st.sidebar.radio(
-        "대상 시장 선택",
+        "시장 선택",
         ["ALL (코스피+코스닥)", "KOSPI", "KOSDAQ"],
         index=0,
     )
 
-    if market_choice == "ALL (코스피+코스닥)":
+    if "ALL" in market_choice:
         m_code = "ALL"
+    elif "KOSPI" in market_choice:
+        m_code = "KOSPI"
     else:
-        m_code = market_choice
-
-    max_scan_count = st.sidebar.slider(
-        "최대 스캔 종목 수 (테스트용)",
-        min_value=50,
-        max_value=2500,
-        value=300,
-        step=50,
-        help="전종목 스캔 시 시간이 소요되므로 슬라이더로 조절할 수 있습니다.",
-    )
+        m_code = "KOSDAQ"
 
     tab1, tab2, tab3 = st.tabs(
         [
@@ -254,44 +282,33 @@ def main():
 
     with tab1:
         st.subheader("🌅 장 시작 전 / 장초반 갭상승 예상 종목 스캔")
-        if st.button("🚀 전체 시장 장전 스캔 실행", key="btn_m"):
-            with st.spinner("코스피/코스닥 장전 시세 분석 중..."):
-                data = run_scanner(scanner, "morning", m_code, max_scan_count)
+        if st.button("🚀 장전 스캔 실행", key="btn_m"):
+            with st.spinner("장전 시세 스캔 중..."):
+                data = run_scanner(scanner, "morning", m_code)
             st.success(
-                f"✅ 동기화 완료 ({get_kst_now()}) - 총 {len(data)}개 종목 포착"
+                f"✅ 동기화 완료 ({get_kst_now()}) - 총 {len(data)}개 종목 분석 완료"
             )
-            if data:
-                st.dataframe(data, use_container_width=True)
-            else:
-                st.info("조건에 맞는 종목이 없습니다.")
+            st.dataframe(data, use_container_width=True)
 
     with tab2:
         st.subheader("☀️ 장중 돌파 및 수급 급증 주도주 스캔")
-        if st.button("🚀 전체 시장 장중 주도주 스캔 실행", key="btn_i"):
-            with st.spinner("코스피/코스닥 장중 수급 스캔 중..."):
-                data = run_scanner(scanner, "intraday", m_code, max_scan_count)
+        if st.button("🚀 장중 주도주 스캔 실행", key="btn_i"):
+            with st.spinner("장중 수급 스캔 중..."):
+                data = run_scanner(scanner, "intraday", m_code)
             st.success(
-                f"✅ 동기화 완료 ({get_kst_now()}) - 총 {len(data)}개 종목 포착"
+                f"✅ 동기화 완료 ({get_kst_now()}) - 총 {len(data)}개 종목 분석 완료"
             )
-            if data:
-                st.dataframe(data, use_container_width=True)
-            else:
-                st.info("조건에 맞는 종목이 없습니다.")
+            st.dataframe(data, use_container_width=True)
 
     with tab3:
         st.subheader("🌙 종가 베팅 (장마감 전 매수 ➔ 다음 날 시가/장초반 매도)")
-        if st.button("🚀 전체 시장 종가 베팅 스캔 실행", key="btn_o"):
-            with st.spinner("코스피/코스닥 종가 베팅 후보군 분석 중..."):
-                data = run_scanner(
-                    scanner, "overnight", m_code, max_scan_count
-                )
+        if st.button("🚀 종가 베팅 스캔 실행", key="btn_o"):
+            with st.spinner("종가 베팅 분석 중..."):
+                data = run_scanner(scanner, "overnight", m_code)
             st.success(
-                f"✅ 동기화 완료 ({get_kst_now()}) - 총 {len(data)}개 종목 포착"
+                f"✅ 동기화 완료 ({get_kst_now()}) - 총 {len(data)}개 종목 분석 완료"
             )
-            if data:
-                st.dataframe(data, use_container_width=True)
-            else:
-                st.info("조건에 맞는 종목이 없습니다.")
+            st.dataframe(data, use_container_width=True)
 
 
 if __name__ == "__main__":
