@@ -8,12 +8,12 @@ class KBSecuritiesScannerEngine:
 
     def __init__(self, appkey: str = "", appsecret: str = ""):
         raw_key = appkey or os.getenv("KB_APPKEY", "")
-        raw_secret = os.getenv("KB_APPSECRET", "") or appsecret
+        raw_secret = appsecret or os.getenv("KB_APPSECRET", "")
         self.appkey = raw_key.strip()
         self.appsecret = raw_secret.strip()
 
-        # KB증권 OpenAPI 실전 게이트웨이 주소
-        self.base_url = "https://openapi.koreainvestment.com:7522"
+        # KB증권 공식 OpenAPI 기본 URL
+        self.base_url = "https://openapi.kbsec.com"
         self.access_token = ""
         self.last_error = ""
 
@@ -24,9 +24,9 @@ class KBSecuritiesScannerEngine:
             )
             return False
 
-        # 토큰 발급 엔드포인트 (JSON 규격)
-        path = "/oauth2/tokenP"
-        headers = {"content-type": "application/json; charset=UTF-8"}
+        # KB증권 공식 규격: POST /oauth2/token, Content-Type: application/json
+        path = "/oauth2/token"
+        headers = {"Content-Type": "application/json; charset=UTF-8"}
         body = {
             "grant_type": "client_credentials",
             "appkey": self.appkey,
@@ -41,8 +41,10 @@ class KBSecuritiesScannerEngine:
             try:
                 data = res.json()
             except Exception:
-                # 다른 도메인 시도 (fallback)
-                return self._get_access_token_fallback()
+                # 서버에서 반환된 원문 일부 출력 (원인 파악용)
+                snippet = res.text[:100].replace("\n", " ")
+                self.last_error = f"응답 형식 오류(상태코드:{res.status_code}): {snippet}"
+                return False
 
             if res.status_code == 200 and "access_token" in data:
                 self.access_token = data.get("access_token", "")
@@ -54,37 +56,7 @@ class KBSecuritiesScannerEngine:
                 )
                 self.last_error = f"KB 응답 오류: {err_msg}"
         except Exception as e:
-            return self._get_access_token_fallback()
-
-        return False
-
-    def _get_access_token_fallback(self) -> bool:
-        """기본 게이트웨이 응답 실패 시 KB 표준 게이트웨이 도메인 재시도"""
-        fallback_url = "https://openapi.kbsec.com"
-        path = "/oauth2/tokenP"
-        headers = {"content-type": "application/x-www-form-urlencoded"}
-        body = {
-            "grant_type": "client_credentials",
-            "appkey": self.appkey,
-            "appsecret": self.appsecret,
-        }
-
-        try:
-            res = requests.post(
-                f"{fallback_url}{path}", headers=headers, data=body, timeout=10
-            )
-            data = res.json()
-            if res.status_code == 200 and "access_token" in data:
-                self.base_url = fallback_url
-                self.access_token = data.get("access_token", "")
-                return True
-            else:
-                err_msg = data.get(
-                    "error_description", data.get("msg1", "인증 실패")
-                )
-                self.last_error = f"KB 서버 응답: {err_msg}"
-        except Exception as e:
-            self.last_error = f"KB 서버 접속 불가: {str(e)}"
+            self.last_error = f"통신 에러: {str(e)}"
 
         return False
 
@@ -95,7 +67,7 @@ class KBSecuritiesScannerEngine:
 
         path_price = "/uapi/domestic-stock/v1/quotations/inquire-price"
         headers = {
-            "content-type": "application/json; charset=utf-8",
+            "Content-Type": "application/json; charset=UTF-8",
             "authorization": f"Bearer {self.access_token}",
             "appkey": self.appkey,
             "appsecret": self.appsecret,
