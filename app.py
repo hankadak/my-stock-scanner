@@ -1,334 +1,240 @@
-from datetime import datetime
-import os
-import time
+from datetime import datetime, timedelta
 import pandas as pd
+from pykrx import stock
 import pytz
-import requests
 import streamlit as st
 
 
-class KBSecuritiesScannerEngine:
+def get_latest_trading_date():
+    """가장 최근 영업일 날짜 구하기"""
+    now = datetime.now(pytz.timezone("Asia/Seoul"))
+    # 주말 처리
+    if now.weekday() == 5:  # 토요일
+        target = now - timedelta(days=1)
+    elif now.weekday() == 6:  # 일요일
+        target = now - timedelta(days=2)
+    else:
+        # 장전(09시 이전)이면 전일 데이터 사용
+        if now.hour < 9:
+            target = now - timedelta(days=1)
+            if target.weekday() == 6:
+                target = target - timedelta(days=2)
+        else:
+            target = now
 
-    def __init__(self, appkey: str = "", appsecret: str = ""):
-        raw_key = appkey or os.getenv("KB_APPKEY", "")
-        raw_secret = appsecret or os.getenv("KB_APPSECRET", "")
-        self.appkey = raw_key.strip()
-        self.appsecret = raw_secret.strip()
-
-        self.base_url = "https://openapi.kbsec.com"
-        self.access_token = ""
-        self.last_error = ""
-
-    def get_access_token(self) -> bool:
-        if not self.appkey or not self.appsecret:
-            self.last_error = (
-                "Secrets에 KB_APPKEY 또는 KB_APPSECRET이 설정되지 않았습니다."
-            )
-            return False
-
-        path = "/oauth2/token"
-        headers = {"content-type": "application/json; charset=UTF-8"}
-        body = {
-            "grant_type": "client_credentials",
-            "appkey": self.appkey,
-            "appsecret": self.appsecret,
-        }
-
-        try:
-            res = requests.post(
-                f"{self.base_url}{path}", headers=headers, json=body, timeout=10
-            )
-            data = res.json()
-
-            if res.status_code == 200 and "access_token" in data:
-                self.access_token = data.get("access_token", "")
-                return True
-            else:
-                err_msg = data.get(
-                    "error_description",
-                    data.get("msg1", data.get("message", "인증 실패")),
-                )
-                self.last_error = f"KB인증실패: {err_msg}"
-        except Exception as e:
-            self.last_error = f"통신에러: {str(e)}"
-
-        return False
-
-    def fetch_realtime_price(self, symbol: str) -> dict:
-        if not self.access_token:
-            if not self.get_access_token():
-                return {"success": False, "reason": self.last_error}
-
-        path_price = "/uapi/domestic-stock/v1/quotations/inquire-price"
-        headers = {
-            "content-type": "application/json; charset=utf-8",
-            "authorization": f"Bearer {self.access_token}",
-            "appkey": self.appkey,
-            "appsecret": self.appsecret,
-            "tr_id": "FHKST01010100",
-        }
-        params_price = {
-            "FID_COND_MRKT_DIV_CODE": "J",
-            "FID_INPUT_ISCD": symbol,
-        }
-
-        try:
-            res = requests.get(
-                f"{self.base_url}{path_price}",
-                headers=headers,
-                params=params_price,
-                timeout=5,
-            )
-            data = res.json()
-
-            if res.status_code == 200:
-                out = data.get("output", {}) or data.get("output1", {})
-                if not out and "stck_prpr" in data:
-                    out = data
-
-                if out:
-                    return {
-                        "success": True,
-                        "name": out.get("hts_kor_isnm", ""),
-                        "price": int(out.get("stck_prpr", 0)),
-                        "power": float(out.get("hts_avls", 0.0)),
-                        "rate": float(out.get("prdy_vrss_rt", 0.0)),
-                        "volume": int(out.get("acml_vol", 0)),
-                    }
-            return {
-                "success": False,
-                "reason": data.get("msg1", "데이터 조회 실패"),
-            }
-        except Exception as e:
-            return {"success": False, "reason": str(e)}
+    return target.strftime("%Y%m%d")
 
 
-@st.cache_data(ttl=3600 * 6)
-def fetch_stock_universe(market_choice="ALL", max_count=300):
-    """네이버 증권 모바일 API를 사용하여 확실하게 종목 리스트 수집"""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
-    }
-
-    stocks = []
-    markets = []
-    if market_choice in ["ALL", "KOSPI"]:
-        markets.append(("KOSPI", "KOSPI"))
-    if market_choice in ["ALL", "KOSDAQ"]:
-        markets.append(("KOSDAQ", "KOSDAQ"))
-
-    # 페이지 당 100개씩 호출
-    pages_needed = max(1, max_count // 50)
-
-    for m_name, m_code in markets:
-        for page in range(1, pages_needed + 1):
-            url = f"https://m.stock.naver.com/api/stocks/marketValue/{m_code}?page={page}&pageSize=50"
-            try:
-                res = requests.get(url, headers=headers, timeout=5)
-                if res.status_code == 200:
-                    data = res.json()
-                    item_list = data.get("stocks", [])
-                    if not item_list:
-                        break
-                    for item in item_list:
-                        code = item.get("itemCode", "")
-                        name = item.get("stockName", "")
-                        if code and name:
-                            stocks.append(
-                                {
-                                    "Code": code,
-                                    "Name": name,
-                                    "Market": m_name,
-                                }
-                            )
-            except Exception:
-                continue
-
-    # 중복 제거
-    unique_stocks = list({s["Code"]: s for s in stocks}.values())
-
-    # 만약 네이버 API 응답 실패 시 하드코딩 백업 작동
-    if not unique_stocks:
-        unique_stocks = [
-            {"Code": "005930", "Name": "삼성전자", "Market": "KOSPI"},
-            {"Code": "000660", "Name": "SK하이닉스", "Market": "KOSPI"},
-            {"Code": "373220", "Name": "LG에너지솔루션", "Market": "KOSPI"},
-            {"Code": "207940", "Name": "삼성바이오로직스", "Market": "KOSPI"},
-            {"Code": "005935", "Name": "삼성전자우", "Market": "KOSPI"},
-            {"Code": "000270", "Name": "기아", "Market": "KOSPI"},
-            {"Code": "005490", "Name": "POSCO홀딩스", "Market": "KOSPI"},
-            {"Code": "035720", "Name": "카카오", "Market": "KOSPI"},
-            {"Code": "247540", "Name": "에코프로비엠", "Market": "KOSDAQ"},
-            {"Code": "086520", "Name": "에코프로", "Market": "KOSDAQ"},
-            {"Code": "068270", "Name": "셀트리온", "Market": "KOSPI"},
-            {"Code": "035420", "Name": "NAVER", "Market": "KOSPI"},
-            {"Code": "105560", "Name": "KB금융", "Market": "KOSPI"},
-            {"Code": "055550", "Name": "신한지주", "Market": "KOSPI"},
-            {"Code": "003550", "Name": "LG", "Market": "KOSPI"},
-            {"Code": "015760", "Name": "한국전력", "Market": "KOSPI"},
-            {"Code": "032830", "Name": "삼성생명", "Market": "KOSPI"},
-            {"Code": "018260", "Name": "삼성SDS", "Market": "KOSPI"},
-            {"Code": "009150", "Name": "삼성전기", "Market": "KOSPI"},
-            {"Code": "010140", "Name": "삼성중공업", "Market": "KOSPI"},
-        ]
-
-    return unique_stocks[:max_count]
+@st.cache_data(ttl=3600 * 4)
+def fetch_krx_market_data(date_str, market="ALL"):
+    """KRX 전체 종목 시세 및 거래대금 데이터 정밀 수집"""
+    try:
+        df = stock.get_market_ohlcv_by_ticker(date_str, market=market)
+        df = df.reset_index()
+        # 종목명 가져오기
+        names = [stock.get_market_ticker_name(code) for code in df["티커"]]
+        df["종목명"] = names
+        return df
+    except Exception as e:
+        st.error(f"데이터 수집 중 오류 발생: {e}")
+        return pd.DataFrame()
 
 
-def get_kst_now():
-    return datetime.now(pytz.timezone("Asia/Seoul")).strftime("%H:%M:%S")
-
-
-def run_scanner(scanner, strategy_type, market_choice, max_scan_count):
-    stock_list = fetch_stock_universe(market_choice, max_scan_count)
-
+def analyze_chart_and_risk(df_ohlcv, target_date_str, strategy):
+    """차트 분석 알고리즘 및 손익분기점(R:R) 계산"""
     results = []
+
+    # 스캔 대상: 거래대금 상위 종목 중심 (우량 수급주 필터링)
+    df_sorted = df_ohlcv.sort_values(by="거래대금", ascending=False).head(400)
+
+    # 날짜 계산 (최근 60일 데이터)
+    end_dt = datetime.strptime(target_date_str, "%Y%m%d")
+    start_dt = end_dt - timedelta(days=100)
+    start_date_str = start_dt.strftime("%Y%m%d")
+
     progress_bar = st.progress(0)
     status_text = st.empty()
+    total = len(df_sorted)
 
-    total_len = len(stock_list)
-
-    for i, stock in enumerate(stock_list):
-        code = stock["Code"]
-        default_name = stock["Name"]
-        market = stock["Market"]
+    for idx, (_, row) in enumerate(df_sorted.iterrows()):
+        code = row["티커"]
+        name = row["종목명"]
 
         status_text.text(
-            f"🔍 [{i+1}/{total_len}] 종목 실시간 스캔 중... {default_name}({code})"
+            f"🔍 [{idx+1}/{total}] {name}({code}) 차트 파동 및 이동평균선 분석 중..."
         )
-        progress_bar.progress((i + 1) / total_len)
+        progress_bar.progress((idx + 1) / total)
 
-        kb_data = scanner.fetch_realtime_price(code)
+        # 개별 종목 차트(OHLCV) 수집
+        df_chart = stock.get_market_ohlcv_by_date(
+            start_date_str, target_date_str, code
+        )
 
-        if kb_data.get("success"):
-            price = kb_data["price"]
-            rate = kb_data["rate"]
-            power = kb_data["power"]
-            volume = kb_data["volume"]
-            name = kb_data["name"] or default_name
+        if len(df_chart) < 30:
+            continue
 
-            signal = ""
-            score = "HOLD"
+        # 이동평균선 계산
+        df_chart["MA5"] = df_chart["종가"].rolling(window=5).mean()
+        df_chart["MA20"] = df_chart["종가"].rolling(window=20).mean()
+        df_chart["MA60"] = df_chart["종가"].rolling(window=60).mean()
+        df_chart["Vol_MA5"] = df_chart["거래량"].rolling(window=5).mean()
 
-            if strategy_type == "morning":
-                if rate >= 1.5 and power >= 120.0:
-                    signal = "🔥 장초반 동시호가 강세 / 갭상승 포착"
-                    score = "BUY"
-                elif rate > 0:
-                    signal = "🟡 시가 보합권 유지 중"
+        curr = df_chart.iloc[-1]  # 당일
+        prev = df_chart.iloc[-2]  # 전일
 
-            elif strategy_type == "intraday":
-                if power >= 130.0 and rate >= 2.0:
-                    signal = "🚀 장중 주도주 (체결강도 급증 + 상승 돌파)"
-                    score = "STRONG BUY"
-                elif power >= 100.0:
-                    signal = "🟢 수급 유입 양호 (추세 지속)"
+        close_price = int(curr["종가"])
+        open_price = int(curr["시가"])
+        high_price = int(curr["고가"])
+        trading_value = int(curr["거래대금"])  # 원 단위
+        trading_value_100m = round(trading_value / 100_000_000)  # 억원 단위
 
-            elif strategy_type == "overnight":
-                if 1.0 <= rate <= 5.0 and power >= 110.0:
-                    signal = "🎯 종가 베팅 조건 적합 (익일 갭상승 기대)"
-                    score = "BUY (종가매수)"
+        rate = round(((close_price - prev["종가"]) / prev["종가"]) * 100, 2)
 
-            results.append(
-                {
-                    "시장": market,
-                    "종목명": name,
-                    "종목코드": code,
-                    "현재가": f"{price:,}원",
-                    "등락률": f"{rate:+.2f}%",
-                    "체결강도": f"{power:.1f}%",
-                    "거래량": f"{volume:,}주",
-                    "전략 포착 신호": signal or "⚪ 스캔 완료",
-                    "매매 판단": score,
-                }
-            )
+        # -------------------------------------------------------------
+        # [전략 1] 강력한 거래대금 + 20일선 돌파 (강세주/주도주 전략)
+        # -------------------------------------------------------------
+        if strategy == "breakout":
+            # 조건: 거래대금 200억 이상 & 당일 양봉 & 20일선 위로 돌파
+            if (
+                trading_value_100m >= 200
+                and close_price > open_price
+                and curr["종가"] > curr["MA20"]
+                and prev["종가"] <= prev["MA20"]
+            ):
 
-        time.sleep(0.03)
+                # 손익분기점(Risk/Reward) 계산
+                stop_loss = int(
+                    open_price * 0.97
+                )  # 손절가: 시가 대각 -3% 지점 또는 시가
+                target_price = int(close_price * 1.07)  # 1차 익절가: +7%
+                risk = close_price - stop_loss
+                reward = target_price - close_price
+                rr_ratio = (
+                    round(reward / risk, 2) if risk > 0 else 0
+                )  # 손익비
+
+                results.append(
+                    {
+                        "종목코드": code,
+                        "종목명": name,
+                        "현재가(종가)": f"{close_price:,}원",
+                        "등락률": f"{rate:+.2f}%",
+                        "거래대금": f"{trading_value_100m:,}억원",
+                        "차트 포착 패턴": "🔥 20일선 거래대금 돌파",
+                        "🎯 1차 목표가(+7%)": f"{target_price:,}원",
+                        "🛡️ 손절 기준가(-3%)": f"{stop_loss:,}원",
+                        "손익비 (R:R)": f"1 : {rr_ratio}",
+                    }
+                )
+
+        # -------------------------------------------------------------
+        # [전략 2] 20일 이동평균선 눌림목 지지 반등 (안정적 눌림목 매수)
+        # -------------------------------------------------------------
+        elif strategy == "pullback":
+            # 조건: 5, 20, 60일 정배열 유지 중 & 20일선 부근(-1.5%~+2%) 지지 양봉
+            is_alignment = curr["MA5"] > curr["MA20"] > curr["MA60"]
+            ma20_dist = ((close_price - curr["MA20"]) / curr["MA20"]) * 100
+
+            if is_alignment and -1.5 <= ma20_dist <= 2.5 and rate > -1.0:
+                stop_loss = int(curr["MA20"] * 0.98)  # 손절가: 20일선 -2% 이탈시
+                target_price = int(close_price * 1.06)  # 1차 익절가: +6%
+                risk = close_price - stop_loss
+                reward = target_price - close_price
+                rr_ratio = round(reward / risk, 2) if risk > 0 else 0
+
+                results.append(
+                    {
+                        "종목코드": code,
+                        "종목명": name,
+                        "현재가(종가)": f"{close_price:,}원",
+                        "등락률": f"{rate:+.2f}%",
+                        "거래대금": f"{trading_value_100m:,}억원",
+                        "차트 포착 패턴": "🌱 20일선 정배열 눌림목 반등",
+                        "🎯 1차 목표가(+6%)": f"{target_price:,}원",
+                        "🛡️ 손절 기준가(-2%)": f"{stop_loss:,}원",
+                        "손익비 (R:R)": f"1 : {rr_ratio}",
+                    }
+                )
 
     progress_bar.empty()
     status_text.empty()
-    return results
+    return pd.DataFrame(results)
 
 
 def main():
     st.set_page_config(
-        page_title="KB증권 코스피/코스닥 전종목 스캐너", layout="wide"
+        page_title="KRX 차트 분석 및 손익분기 매매 스캐너", layout="wide"
     )
-    st.title("📈 KB증권 코스피 & 코스닥 전체종목 맞춤 스캐너")
 
-    scanner = KBSecuritiesScannerEngine()
+    st.title("📊 정밀 차트 파동 & 손익분기점(Risk/Reward) 매매 스캐너")
+    st.caption(
+        "한국거래소(KRX) 공식 데이터 기반 - 정확한 기술적 차트 지표와 손익비를 계산합니다."
+    )
 
-    if not scanner.appkey or not scanner.appsecret:
-        st.error(
-            "⚠️ Streamlit Secrets에 KB_APPKEY와 KB_APPSECRET을 올바르게 등록해 주세요."
-        )
+    # 기준 거래일 계산
+    latest_date = get_latest_trading_date()
 
-    st.sidebar.header("⚙️ 스캔 범위 설정")
+    st.sidebar.header("⚙️ 분석 설정")
     market_choice = st.sidebar.radio(
-        "시장 선택",
-        ["ALL (코스피+코스닥)", "KOSPI", "KOSDAQ"],
-        index=0,
+        "분석 대상 시장", ["ALL", "KOSPI", "KOSDAQ"], index=0
     )
 
-    if "ALL" in market_choice:
-        m_code = "ALL"
-    elif "KOSPI" in market_choice:
-        m_code = "KOSPI"
-    else:
-        m_code = "KOSDAQ"
-
-    max_scan_count = st.sidebar.slider(
-        "스캔할 종목 수 선택",
-        min_value=50,
-        max_value=1000,
-        value=100,
-        step=50,
-        help="종목 수가 많을수록 스캔에 시간이 더 걸립니다.",
+    st.sidebar.info(
+        f"📅 분석 기준 거래일자: **{latest_date[:4]}-{latest_date[4:6]}-{latest_date[6:]}**"
     )
 
-    tab1, tab2, tab3 = st.tabs(
+    tab1, tab2 = st.tabs(
         [
-            "🌅 1. 오전장 시작 전 탐색 (08:30~09:00)",
-            "☀️ 2. 장중 주도주 탐색 (09:30~14:30)",
-            "🌙 3. 장마감 전 매수 ➔ 익일 매도 (15:00~15:20)",
+            "🔥 1. 거래대금 돌파 전략 (주도주/급등주)",
+            "🌱 2. 20일선 눌림목 지지 전략 (안정적 눌림)",
         ]
     )
 
+    # KRX 시세 로드
+    with st.spinner("한국거래소(KRX) 전종목 시세 데이터 검증 중..."):
+        df_ohlcv = fetch_krx_market_data(latest_date, market_choice)
+
+    if df_ohlcv.empty:
+        st.error(
+            "시세 데이터를 불러오지 못했습니다. 장 개장 여부를 확인해 주세요."
+        )
+        return
+
     with tab1:
-        st.subheader("🌅 장 시작 전 / 장초반 갭상승 예상 종목 스캔")
-        if st.button("🚀 장전 스캔 실행", key="btn_m"):
-            with st.spinner("장전 시세 스캔 중..."):
-                data = run_scanner(
-                    scanner, "morning", m_code, max_scan_count
+        st.subheader("🔥 강한 수급(거래대금 200억+) + 20일선 돌파 종목")
+        st.markdown(
+            "**매매 원칙:** 손익비 1:2 이상 설정. 손절가 이탈 시 미련 없이 손절하고, 목표가 도달 시 반절 익절하는 전략입니다."
+        )
+
+        if st.button("🚀 돌파 패턴 종목 스캔 실행", key="btn_breakout"):
+            df_res = analyze_chart_and_risk(df_ohlcv, latest_date, "breakout")
+            if not df_res.empty:
+                st.success(
+                    f"✅ 포착 완료: 총 {len(df_res)}개 종목이 차트 돌파 조건 및 손익비 기준에 부합합니다."
                 )
-            st.success(
-                f"✅ 동기화 완료 ({get_kst_now()}) - 총 {len(data)}개 종목 분석 완료"
-            )
-            st.dataframe(data, use_container_width=True)
+                st.dataframe(df_res, use_container_width=True)
+            else:
+                st.warning(
+                    "현재 조건에 부합하는 돌파 패턴 종목이 없습니다."
+                )
 
     with tab2:
-        st.subheader("☀️ 장중 돌파 및 수급 급증 주도주 스캔")
-        if st.button("🚀 장중 주도주 스캔 실행", key="btn_i"):
-            with st.spinner("장중 수급 스캔 중..."):
-                data = run_scanner(
-                    scanner, "intraday", m_code, max_scan_count
-                )
-            st.success(
-                f"✅ 동기화 완료 ({get_kst_now()}) - 총 {len(data)}개 종목 분석 완료"
-            )
-            st.dataframe(data, use_container_width=True)
+        st.subheader("🌱 정배열 추세 + 20일 이동평균선 눌림목 반등 종목")
+        st.markdown(
+            "**매매 원칙:** 5일-20일-60일 정배열 상태에서 20일 이동평균선 지지를 확인 후 분할 매수합니다."
+        )
 
-    with tab3:
-        st.subheader("🌙 종가 베팅 (장마감 전 매수 ➔ 다음 날 시가/장초반 매도)")
-        if st.button("🚀 종가 베팅 스캔 실행", key="btn_o"):
-            with st.spinner("종가 베팅 분석 중..."):
-                data = run_scanner(
-                    scanner, "overnight", m_code, max_scan_count
+        if st.button("🚀 눌림목 패턴 종목 스캔 실행", key="btn_pullback"):
+            df_res = analyze_chart_and_risk(df_ohlcv, latest_date, "pullback")
+            if not df_res.empty:
+                st.success(
+                    f"✅ 포착 완료: 총 {len(df_res)}개 종목이 눌림목 차트 조건에 부합합니다."
                 )
-            st.success(
-                f"✅ 동기화 완료 ({get_kst_now()}) - 총 {len(data)}개 종목 분석 완료"
-            )
-            st.dataframe(data, use_container_width=True)
+                st.dataframe(df_res, use_container_width=True)
+            else:
+                st.warning(
+                    "현재 조건에 부합하는 눌림목 패턴 종목이 없습니다."
+                )
 
 
 if __name__ == "__main__":
