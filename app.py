@@ -13,11 +13,8 @@ class KBSecuritiesScannerEngine:
         self.appkey = raw_key.strip()
         self.appsecret = raw_secret.strip()
 
-        # 기본 실전 도메인 & 모의 도메인
-        self.real_url = "https://openapi.kbsec.com"
-        self.mock_url = "https://openapivts.kbsec.com:29443"
-
-        self.base_url = self.real_url
+        # KB증권 단일 통합 도메인
+        self.base_url = "https://openapi.kbsec.com"
         self.access_token = ""
         self.last_error = ""
 
@@ -28,19 +25,7 @@ class KBSecuritiesScannerEngine:
             )
             return False
 
-        # 1. 실전 서버 접속 시도
-        if self._request_token(self.real_url):
-            self.base_url = self.real_url
-            return True
-
-        # 2. 실전 실패 시 모의투자 서버 접속 시도
-        if self._request_token(self.mock_url):
-            self.base_url = self.mock_url
-            return True
-
-        return False
-
-    def _request_token(self, target_url: str) -> bool:
+        # KB증권 표준 인증
         path = "/oauth2/tokenP"
         headers = {"content-type": "application/x-www-form-urlencoded"}
         body = {
@@ -51,14 +36,16 @@ class KBSecuritiesScannerEngine:
 
         try:
             res = requests.post(
-                f"{target_url}{path}", headers=headers, data=body, timeout=8
+                f"{self.base_url}{path}", headers=headers, data=body, timeout=10
             )
 
             try:
                 data = res.json()
             except Exception:
-                # HTML 응답이 들어올 경우
-                self.last_error = f"KB 서버 응답 오류 (HTML 반환 / Key 서비스 미신청 상태 가능성 높음)"
+                text_preview = res.text[:80].replace("\n", " ")
+                self.last_error = (
+                    f"KB 서버 응답 형식 오류 (상태:{res.status_code})"
+                )
                 return False
 
             if res.status_code == 200 and "access_token" in data:
@@ -69,9 +56,9 @@ class KBSecuritiesScannerEngine:
                     "error_description",
                     data.get("msg1", data.get("message", "인증 실패")),
                 )
-                self.last_error = f"KB 인증 오류: {err_msg}"
+                self.last_error = f"KB 인증 에러: {err_msg}"
         except Exception as e:
-            self.last_error = f"통신 장애: {str(e)}"
+            self.last_error = f"통신 네트워크 에러: {str(e)}"
 
         return False
 
@@ -98,7 +85,7 @@ class KBSecuritiesScannerEngine:
                 f"{self.base_url}{path_price}",
                 headers=headers,
                 params=params_price,
-                timeout=8,
+                timeout=10,
             )
             if res.status_code == 200:
                 data = res.json()
@@ -115,10 +102,10 @@ class KBSecuritiesScannerEngine:
             else:
                 return {
                     "success": False,
-                    "reason": f"시세조회 실패 ({res.status_code})",
+                    "reason": f"시세조회 응답 오류 ({res.status_code})",
                 }
         except Exception as e:
-            return {"success": False, "reason": f"통신 오류: {str(e)}"}
+            return {"success": False, "reason": f"데이터 통신 에러: {str(e)}"}
 
     def scan_by_strategy(self, strategy_type: str) -> list:
         universe = [
