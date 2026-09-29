@@ -1,18 +1,18 @@
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import xml.etree.ElementTree as ET
 import pandas as pd
-import pytz
 import requests
 import streamlit as st
 
 
 def get_kst_now():
-    return datetime.now(pytz.timezone("Asia/Seoul"))
+    """파이썬 내장 datetime만으로 KST(한국 표준시) 구하기 (pytz 의존성 제거)"""
+    return datetime.now(timezone(timedelta(hours=9)))
 
 
 @st.cache_data(ttl=3600 * 4)
 def fetch_top_market_cap_stocks(market="ALL", limit=300):
-    """네이버 증권 API 기반 상위 종목 수집 (외부 모듈 오류 차단)"""
+    """네이버 증권 API 기반 상위 종목 수집"""
     headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
     }
@@ -135,18 +135,15 @@ def run_timeframe_scanner(market_choice, strategy_type, scan_limit):
         )
 
         # -----------------------------------------------------------------
-        # B안 핵심: 차트 정밀 수치 진단 계산
+        # 차트 정밀 수치 진단 계산 (윗꼬리 & 20일선 이격도)
         # -----------------------------------------------------------------
-        # 1. 윗꼬리 비율 (고점 대비 밀린 폭)
         wick_ratio = (
             round(((high_p - close_p) / (high_p - open_p + 1e-5)) * 100, 1)
             if high_p > open_p
             else 0
         )
-        # 2. 20일선 이격도
         ma20_gap = round(((close_p - curr["MA20"]) / curr["MA20"]) * 100, 1)
 
-        # 3. 종합 진단 등급 판정
         if wick_ratio > 45.0 or ma20_gap > 12.0:
             diag_grade = "🔴 유의 (차익매물/과열)"
             diag_desc = "고점 차익실현 매물 압박이 있거나 이격도가 높음"
@@ -158,7 +155,7 @@ def run_timeframe_scanner(market_choice, strategy_type, scan_limit):
             diag_desc = "손익비 위치 우수 및 차트 파동 양호"
 
         # -----------------------------------------------------------------
-        # 전략별 스캔 및 포착
+        # 전략별 스캔
         # -----------------------------------------------------------------
         if strategy_type == "morning":
             gap_rate = round(
@@ -184,7 +181,7 @@ def run_timeframe_scanner(market_choice, strategy_type, scan_limit):
                         "윗꼬리 비율": f"{wick_ratio:.1f}%",
                         "20일선 이격도": f"{ma20_gap:+.1f}%",
                         "🎯 1차 목표가": f"{target_p:,}원",
-                        "🛡️ 손절 기준가": f"{stop_loss:,}원",
+                        "🛡️️ 손절 기준가": f"{stop_loss:,}원",
                         "손익비 (R:R)": f"1 : {rr_ratio}",
                         "진단 요약": diag_desc,
                     }
@@ -274,7 +271,7 @@ def main():
 
     st.title("📈 B안: 정밀 차트 수치 진단 & 손익분기점(R:R) 스캐너")
     st.caption(
-        "외부 차트 라이브러리 설치 없이 윗꼬리 비율, 20일선 이격도, 수급 과열 진단 리포트를 안전하게 제공합니다."
+        "외부 패키지 없이 파이썬 순수 라이브러리로 윗꼬리 비율, 20일선 이격도, 과열 진단 리포트를 제공합니다."
     )
 
     st.sidebar.header("⚙️ 스캔 범위 설정")
