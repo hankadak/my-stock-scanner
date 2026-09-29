@@ -1,5 +1,6 @@
 from datetime import datetime
 import os
+import pytz
 import requests
 import streamlit as st
 
@@ -12,8 +13,11 @@ class KBSecuritiesScannerEngine:
         self.appkey = raw_key.strip()
         self.appsecret = raw_secret.strip()
 
-        # KB증권 공식 OpenAPI 기본 URL
-        self.base_url = "https://openapi.kbsec.com"
+        # 기본 실전 도메인 & 모의 도메인
+        self.real_url = "https://openapi.kbsec.com"
+        self.mock_url = "https://openapivts.kbsec.com:29443"
+
+        self.base_url = self.real_url
         self.access_token = ""
         self.last_error = ""
 
@@ -24,9 +28,21 @@ class KBSecuritiesScannerEngine:
             )
             return False
 
-        # KB증권 공식 규격: POST /oauth2/token, Content-Type: application/json
-        path = "/oauth2/token"
-        headers = {"Content-Type": "application/json; charset=UTF-8"}
+        # 1. 실전 서버 접속 시도
+        if self._request_token(self.real_url):
+            self.base_url = self.real_url
+            return True
+
+        # 2. 실전 실패 시 모의투자 서버 접속 시도
+        if self._request_token(self.mock_url):
+            self.base_url = self.mock_url
+            return True
+
+        return False
+
+    def _request_token(self, target_url: str) -> bool:
+        path = "/oauth2/tokenP"
+        headers = {"content-type": "application/x-www-form-urlencoded"}
         body = {
             "grant_type": "client_credentials",
             "appkey": self.appkey,
@@ -35,15 +51,14 @@ class KBSecuritiesScannerEngine:
 
         try:
             res = requests.post(
-                f"{self.base_url}{path}", headers=headers, json=body, timeout=10
+                f"{target_url}{path}", headers=headers, data=body, timeout=8
             )
 
             try:
                 data = res.json()
             except Exception:
-                # 서버에서 반환된 원문 일부 출력 (원인 파악용)
-                snippet = res.text[:100].replace("\n", " ")
-                self.last_error = f"응답 형식 오류(상태코드:{res.status_code}): {snippet}"
+                # HTML 응답이 들어올 경우
+                self.last_error = f"KB 서버 응답 오류 (HTML 반환 / Key 서비스 미신청 상태 가능성 높음)"
                 return False
 
             if res.status_code == 200 and "access_token" in data:
@@ -54,9 +69,9 @@ class KBSecuritiesScannerEngine:
                     "error_description",
                     data.get("msg1", data.get("message", "인증 실패")),
                 )
-                self.last_error = f"KB 응답 오류: {err_msg}"
+                self.last_error = f"KB 인증 오류: {err_msg}"
         except Exception as e:
-            self.last_error = f"통신 에러: {str(e)}"
+            self.last_error = f"통신 장애: {str(e)}"
 
         return False
 
@@ -67,7 +82,7 @@ class KBSecuritiesScannerEngine:
 
         path_price = "/uapi/domestic-stock/v1/quotations/inquire-price"
         headers = {
-            "Content-Type": "application/json; charset=UTF-8",
+            "content-type": "application/json; charset=utf-8",
             "authorization": f"Bearer {self.access_token}",
             "appkey": self.appkey,
             "appsecret": self.appsecret,
@@ -83,7 +98,7 @@ class KBSecuritiesScannerEngine:
                 f"{self.base_url}{path_price}",
                 headers=headers,
                 params=params_price,
-                timeout=10,
+                timeout=8,
             )
             if res.status_code == 200:
                 data = res.json()
@@ -97,10 +112,13 @@ class KBSecuritiesScannerEngine:
                     "rate": float(out.get("prdy_vrss_rt", 0.0)),
                     "volume": int(out.get("acml_vol", 0)),
                 }
-        except Exception:
-            pass
-
-        return {"success": False, "reason": "시세 데이터 파싱 오류"}
+            else:
+                return {
+                    "success": False,
+                    "reason": f"시세조회 실패 ({res.status_code})",
+                }
+        except Exception as e:
+            return {"success": False, "reason": f"통신 오류: {str(e)}"}
 
     def scan_by_strategy(self, strategy_type: str) -> list:
         universe = [
@@ -189,6 +207,10 @@ class KBSecuritiesScannerEngine:
         return results
 
 
+def get_kst_now():
+    return datetime.now(pytz.timezone("Asia/Seoul")).strftime("%H:%M:%S")
+
+
 def main():
     st.set_page_config(
         page_title="KB증권 시점별 맞춤 스캐너", layout="wide"
@@ -216,9 +238,7 @@ def main():
         if st.button("🚀 장전 스캔 실행", key="btn_m"):
             with st.spinner("장전 시세 분석 중..."):
                 data = scanner.scan_by_strategy("morning")
-            st.success(
-                f"✅ 동기화 완료 ({datetime.now().strftime('%H:%M:%S')})"
-            )
+            st.success(f"✅ 동기화 완료 ({get_kst_now()})")
             st.dataframe(data, use_container_width=True)
 
     with tab2:
@@ -227,9 +247,7 @@ def main():
         if st.button("🚀 장중 주도주 스캔 실행", key="btn_i"):
             with st.spinner("장중 수급 스캔 중..."):
                 data = scanner.scan_by_strategy("intraday")
-            st.success(
-                f"✅ 동기화 완료 ({datetime.now().strftime('%H:%M:%S')})"
-            )
+            st.success(f"✅ 동기화 완료 ({get_kst_now()})")
             st.dataframe(data, use_container_width=True)
 
     with tab3:
@@ -238,9 +256,7 @@ def main():
         if st.button("🚀 종가 베팅 종목 스캔 실행", key="btn_o"):
             with st.spinner("종가 베팅 후보군 분석 중..."):
                 data = scanner.scan_by_strategy("overnight")
-            st.success(
-                f"✅ 동기화 완료 ({datetime.now().strftime('%H:%M:%S')})"
-            )
+            st.success(f"✅ 동기화 완료 ({get_kst_now()})")
             st.dataframe(data, use_container_width=True)
 
 
