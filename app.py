@@ -1,4 +1,5 @@
-from datetime import datetime, timedelta
+from datetime import datetime
+import xml.etree.ElementTree as ET
 import pandas as pd
 import pytz
 import requests
@@ -11,7 +12,7 @@ def get_kst_now():
 
 @st.cache_data(ttl=3600 * 4)
 def fetch_top_market_cap_stocks(market="ALL", limit=300):
-    """네이버 증권 모바일 API를 사용하여 코스피/코스닥 상위 종목 수집 (외부 패키지 미사용)"""
+    """네이버 증권 API 기반 상위 종목 목록 수집 (모듈 설치 오류 차단)"""
     headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
     }
@@ -49,26 +50,21 @@ def fetch_top_market_cap_stocks(market="ALL", limit=300):
             except Exception:
                 continue
 
-    # 중복 제거
     unique_stocks = list({s["Code"]: s for s in stocks}.values())
     return unique_stocks[:limit]
 
 
-def fetch_daily_chart_ohlcv(symbol, count=100):
-    """네이버 차트 API로 개별 종목의 일봉 OHLCV 차트 데이터 직접 파싱"""
+def fetch_daily_chart_ohlcv(symbol, count=80):
+    """네이버 일봉 차트 파싱 및 이동평균선/기술적 지표 정밀 계산"""
     url = f"https://fchart.stock.naver.com/sise.nhn?symbol={symbol}&timeframe=day&count={count}&requestType=0"
     try:
         res = requests.get(url, timeout=5)
-        # XML 형식 데이터 파싱
-        import xml.etree.ElementTree as ET
-
         root = ET.fromstring(res.text)
 
         chart_data = []
         for item in root.findall(".//item"):
             data_str = item.attrib.get("data", "")
             if data_str:
-                # 날짜, 시가, 고가, 저가, 종가, 거래량
                 parts = data_str.split("|")
                 if len(parts) >= 6:
                     chart_data.append(
@@ -86,12 +82,13 @@ def fetch_daily_chart_ohlcv(symbol, count=100):
         if df.empty:
             return df
 
-        # 기술적 지표 및 이동평균선 계산
+        # 기술적 이동평균선 산출
         df["MA5"] = df["Close"].rolling(window=5).mean()
         df["MA20"] = df["Close"].rolling(window=20).mean()
         df["MA60"] = df["Close"].rolling(window=60).mean()
+        df["Vol_MA5"] = df["Volume"].rolling(window=5).mean()
 
-        # 대략적인 당일 거래대금 계산 (종가 * 거래량)
+        # 거래대금 추정 (원 단위)
         df["TradingValue"] = df["Close"] * df["Volume"]
 
         return df
@@ -99,7 +96,7 @@ def fetch_daily_chart_ohlcv(symbol, count=100):
         return pd.DataFrame()
 
 
-def run_chart_scanner(market_choice, strategy_type, scan_limit):
+def run_timeframe_scanner(market_choice, strategy_type, scan_limit):
     stock_list = fetch_top_market_cap_stocks(
         market=market_choice, limit=scan_limit
     )
@@ -131,26 +128,28 @@ def run_chart_scanner(market_choice, strategy_type, scan_limit):
         close_p = int(curr["Close"])
         open_p = int(curr["Open"])
         high_p = int(curr["High"])
-        volume = int(curr["Volume"])
+        low_p = int(curr["Low"])
 
         trading_val_100m = round(int(curr["TradingValue"]) / 100_000_000)  # 억원
         rate = round(((close_p - prev["Close"]) / prev["Close"]) * 100, 2)
+        vol_ratio = (
+            round((curr["Volume"] / prev["Vol_MA5"]) * 100, 1)
+            if prev["Vol_MA5"] > 0
+            else 100.0
+        )
 
         # -----------------------------------------------------------------
-        # [전략 1] 강한 수급 거래대금 + 20일 이동평균선 거래량 돌파
+        # 🌅 1. 장초반 단타 (08:30~10:00): 갭상승 + 시가 지지 강한 거래량 돌파
         # -----------------------------------------------------------------
-        if strategy_type == "breakout":
-            # 조건: 양봉 & 20일선 위로 상향 돌파 & 거래대금 100억 이상
-            if (
-                close_p > open_p
-                and curr["Close"] > curr["MA20"]
-                and prev["Close"] <= prev["MA20"]
-                and trading_val_100m >= 100
-            ):
+        if strategy_type == "morning":
+            # 조건: 갭상승(+1.5%~+6.5%) 출발 후 시가 지지 + 양봉 유지 + 거래량 5일 평균 대비 150% 이상
+            gap_rate = round(
+                ((open_p - prev["Close"]) / prev["Close"]) * 100, 2
+            )
 
-                # 손익분기점(Risk/Reward) 산출
-                stop_loss = int(open_p * 0.97)  # 손절가: -3% (또는 당일 시가)
-                target_p = int(close_p * 1.07)  # 1차 목표가: +7%
+            if 1.5 <= gap_rate <= 6.5 and close_p >= open_p and vol_ratio >= 150:
+                stop_loss = int(open_p * 0.98)  # 손절가: 시가 이탈 (-2%)
+                target_p = int(close_p * 1.045)  # 1차 익절가: +4.5% 단타
 
                 risk = close_p - stop_loss
                 reward = target_p - close_p
@@ -165,25 +164,44 @@ def run_chart_scanner(market_choice, strategy_type, scan_limit):
                         "종목코드": code,
                         "현재가": f"{close_p:,}원",
                         "등락률": f"{rate:+.2f}%",
-                        "추정 거래대금": f"{trading_val_100m:,}억원",
-                        "차트 포착 패턴": "🔥 20일선 수급 돌파",
-                        "🎯 1차 목표가(+7%)": f"{target_p:,}원",
-                        "🛡️ 손절 기준가(-3%)": f"{stop_loss:,}원",
+                        "시가 갭률": f"{gap_rate:+.2f}%",
+                        "거래량 폭발비": f"{vol_ratio:.0f}%",
+                        "차트 타점": "⚡ 시가 지지 갭상승 돌파",
+                        "🎯 1차 목표가(+4.5%)": f"{target_p:,}원",
+                        "🛡️ 손절 기준가(-2%)": f"{stop_loss:,}원",
                         "손익비 (R:R)": f"1 : {rr_ratio}",
                     }
                 )
 
         # -----------------------------------------------------------------
-        # [전략 2] 정배열 추세 + 20일 이동평균선 눌림목 반등
+        # ☀️ 2. 일과 중 주도주 (10:00~14:30): 거래대금 터진 20일선 돌파 & 눌림목
         # -----------------------------------------------------------------
-        elif strategy_type == "pullback":
-            # 조건: 5-20-60일 이평선 정배열 & 20일선 부근 지지 반등 (-1.5% ~ +2.5%)
-            is_aligned = curr["MA5"] > curr["MA20"] > curr["MA60"]
-            ma20_dist = ((close_p - curr["MA20"]) / curr["MA20"]) * 100
+        elif strategy_type == "intraday":
+            # 조건: 당일 거래대금 100억 이상 + 20일 이동평균선 상향 돌파 또는 정배열 눌림목
+            is_breakout = (
+                close_p > open_p
+                and curr["Close"] > curr["MA20"]
+                and prev["Close"] <= prev["MA20"]
+            )
+            is_aligned_pullback = (
+                curr["MA5"] > curr["MA20"] > curr["MA60"]
+                and abs((close_p - curr["MA20"]) / curr["MA20"]) <= 0.02
+            )
 
-            if is_aligned and -1.5 <= ma20_dist <= 2.5 and rate >= -1.0:
-                stop_loss = int(curr["MA20"] * 0.98)  # 손절가: 20일선 -2% 이탈
-                target_p = int(close_p * 1.06)  # 1차 목표가: +6%
+            if trading_val_100m >= 100 and (
+                is_breakout or is_aligned_pullback
+            ):
+                pattern_name = (
+                    "🔥 20일선 주도주 돌파"
+                    if is_breakout
+                    else "🌱 20일선 정배열 눌림"
+                )
+                stop_loss = (
+                    int(open_p * 0.97)
+                    if is_breakout
+                    else int(curr["MA20"] * 0.98)
+                )
+                target_p = int(close_p * 1.06)  # 목표가: +6%
 
                 risk = close_p - stop_loss
                 reward = target_p - close_p
@@ -197,9 +215,45 @@ def run_chart_scanner(market_choice, strategy_type, scan_limit):
                         "현재가": f"{close_p:,}원",
                         "등락률": f"{rate:+.2f}%",
                         "추정 거래대금": f"{trading_val_100m:,}억원",
-                        "차트 포착 패턴": "🌱 20일선 정배열 눌림목",
+                        "차트 타점": pattern_name,
                         "🎯 1차 목표가(+6%)": f"{target_p:,}원",
-                        "🛡️ 손절 기준가(-2%)": f"{stop_loss:,}원",
+                        "🛡️ 손절 기준가": f"{stop_loss:,}원",
+                        "손익비 (R:R)": f"1 : {rr_ratio}",
+                    }
+                )
+
+        # -----------------------------------------------------------------
+        # 🌙 3. 마감장 / 에프터마켓 (15:00~익일): 종가 베팅 (익일 갭상승 노림)
+        # -----------------------------------------------------------------
+        elif strategy_type == "overnight":
+            # 조건: 당일 +2% ~ +8% 안정적 양봉 마감 + 5일선 위 유지를 통한 익일 갭상승 기대
+            if (
+                2.0 <= rate <= 8.0
+                and close_p > open_p
+                and curr["Close"] > curr["MA5"]
+            ):
+                stop_loss = int(
+                    curr["MA5"] * 0.985
+                )  # 손절가: 5일 이평선 -1.5% 하향 이탈시
+                target_p = int(
+                    close_p * 1.05
+                )  # 익일 목표가: 시가 및 장초반 +5%
+
+                risk = close_p - stop_loss
+                reward = target_p - close_p
+                rr_ratio = round(reward / risk, 2) if risk > 0 else 0
+
+                results.append(
+                    {
+                        "시장": market,
+                        "종목명": name,
+                        "종목코드": code,
+                        "현재가(종가)": f"{close_p:,}원",
+                        "당일 등락률": f"{rate:+.2f}%",
+                        "추정 거래대금": f"{trading_val_100m:,}억원",
+                        "차트 타점": "🎯 5일선 종가 지지 (익일 갭 유망)",
+                        "🎯 익일 목표가(+5%)": f"{target_p:,}원",
+                        "🛡️ 손절 기준가(-1.5%)": f"{stop_loss:,}원",
                         "손익비 (R:R)": f"1 : {rr_ratio}",
                     }
                 )
@@ -211,15 +265,15 @@ def run_chart_scanner(market_choice, strategy_type, scan_limit):
 
 def main():
     st.set_page_config(
-        page_title="정밀 차트 분석 및 손익분기 매매 스캐너", layout="wide"
+        page_title="시간대별 차트 파동 & 손익분기 매매 스캐너", layout="wide"
     )
 
-    st.title("📈 차트 파동 분석 & 손익분기점(Risk/Reward) 매매 스캐너")
+    st.title("📈 시간대별 맞춤 차트 파동 & 손익분기점(R:R) 스캐너")
     st.caption(
-        "외부 의존성 패키지 없이 직접 차트 지표를 추출하여 100% 안정적으로 작동합니다."
+        "오전단타 / 장중 주도주 / 마감장(에프터마켓) 종가베팅 타점 및 목표가·손절가를 자동 분석합니다."
     )
 
-    st.sidebar.header("⚙️ 분석 범위 설정")
+    st.sidebar.header("⚙️ 스캔 범위 설정")
     market_choice = st.sidebar.radio(
         "분석 시장 선택", ["ALL (코스피+코스닥)", "KOSPI", "KOSDAQ"], index=0
     )
@@ -237,54 +291,69 @@ def main():
         max_value=500,
         value=200,
         step=50,
-        help="상위 종목 수가 늘어날수록 차트 정밀 계산 시간이 추가됩니다.",
+        help="종목 수가 많을수록 차트 정밀 분석 시간이 더 소요됩니다.",
     )
 
-    tab1, tab2 = st.tabs(
+    tab1, tab2, tab3 = st.tabs(
         [
-            "🔥 1. 수급 돌파 전략 (거래대금 + 20일선 돌파)",
-            "🌱 2. 눌림목 반등 전략 (정배열 + 20일선 눌림)",
+            "⚡ 1. 오전 단타 탐색 (08:30~10:00)",
+            "☀️ 2. 일과 중 주도주 탐색 (10:00~14:30)",
+            "🌙 3. 마감장/에프터마켓 매수 ➔ 익일 매도 (15:00~)",
         ]
     )
 
     with tab1:
-        st.subheader("🔥 강한 거래대금 + 20일 이동평균선 돌파 종목")
+        st.subheader("⚡ 장초반 시가 지지 & 거래량 폭발 단타 종목")
         st.markdown(
-            "**매매 가이드:** 당일 20일선 위로 거래량이 실리며 돌파한 종목을 포착합니다. 제시된 손절가(-3%) 준수 시 손익비 1:2 이상을 확보합니다."
+            "**전략 가이드:** 시가 갭상승 후 시가를 깨지 않고 거래량이 실리는 종목을 포착합니다. (익절 +4.5% / 손절 -2%)"
         )
-
-        if st.button("🚀 돌파 패턴 스캔 실행", key="btn_b"):
-            with st.spinner("일봉 차트 이동평균선 및 수급 파동 분석 중..."):
-                df_res = run_chart_scanner(m_code, "breakout", scan_limit)
-
+        if st.button("🚀 오전 단타 스캔 실행", key="btn_m"):
+            with st.spinner("장초반 시가 파동 및 거래량 분석 중..."):
+                df_res = run_timeframe_scanner(m_code, "morning", scan_limit)
             if not df_res.empty:
                 st.success(
-                    f"✅ 분석 완료: 총 {len(df_res)}개 종목이 차트 돌파 조건에 포착되었습니다."
+                    f"✅ 포착 완료: 총 {len(df_res)}개 종목이 오전 단타 조건에 부합합니다."
                 )
                 st.dataframe(df_res, use_container_width=True)
             else:
                 st.warning(
-                    "현재 조건에 부합하는 20일선 돌파 종목이 없습니다."
+                    "현재 조건에 부합하는 오전 단타 종목이 없습니다."
                 )
 
     with tab2:
-        st.subheader("🌱 정배열 추세 + 20일 이동평균선 눌림목 지지 종목")
+        st.subheader("☀️ 일과 중 거래대금 주도주 & 20일선 눌림목 종목")
         st.markdown(
-            "**매매 가이드:** 5일, 20일, 60일 이평선이 정배열을 이룬 우상향 차트에서 20일선 근처까지 눌림을 주고 반등하는 종목을 스캔합니다."
+            "**전략 가이드:** 거래대금 100억 이상 터진 주도주 돌파 또는 20일선 정배열 눌림목 종목을 스캔합니다. (익절 +6%)"
         )
-
-        if st.button("🚀 눌림목 패턴 스캔 실행", key="btn_p"):
-            with st.spinner("일봉 차트 이동평균선 및 수급 파동 분석 중..."):
-                df_res = run_chart_scanner(m_code, "pullback", scan_limit)
-
+        if st.button("🚀 일과 중 주도주 스캔 실행", key="btn_i"):
+            with st.spinner("일봉 이평선 및 수급 파동 분석 중..."):
+                df_res = run_timeframe_scanner(m_code, "intraday", scan_limit)
             if not df_res.empty:
                 st.success(
-                    f"✅ 분석 완료: 총 {len(df_res)}개 종목이 눌림목 차트 조건에 포착되었습니다."
+                    f"✅ 포착 완료: 총 {len(df_res)}개 종목이 주도주 조건에 부합합니다."
                 )
                 st.dataframe(df_res, use_container_width=True)
             else:
                 st.warning(
-                    "현재 조건에 부합하는 눌림목 종목이 없습니다."
+                    "현재 조건에 부합하는 장중 주도주 종목이 없습니다."
+                )
+
+    with tab3:
+        st.subheader("🌙 마감장/시간외(에프터마켓) 종가 매수 ➔ 익일 매도")
+        st.markdown(
+            "**전략 가이드:** 당일 양봉을 유지하고 5일선 지지를 받으며 마감하는 종목을 포착하여 다음 날 시가/장초반 갭상승에 매도합니다."
+        )
+        if st.button("🚀 종가 베팅 스캔 실행", key="btn_o"):
+            with st.spinner("마감장 종가 파동 분석 중..."):
+                df_res = run_timeframe_scanner(m_code, "overnight", scan_limit)
+            if not df_res.empty:
+                st.success(
+                    f"✅ 포착 완료: 총 {len(df_res)}개 종목이 종가 베팅 조건에 부합합니다."
+                )
+                st.dataframe(df_res, use_container_width=True)
+            else:
+                st.warning(
+                    "현재 조건에 부합하는 종가 베팅 종목이 없습니다."
                 )
 
 
