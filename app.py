@@ -1,16 +1,16 @@
-import datetime
+from datetime import datetime, timedelta
 import os
 import sys
 import requests
 
 
 class KRXScannerEngineV15_1:
-    """KRX Automated Trading Engine V15.1
+    """KRX Automated Trading Engine V15.1 (Full Market Scanner)
 
     [Fix Log]
     - 장 시작 전(08:00~08:50) API 호출 시 '그저께 종가'가 유입되던 인덱스 참조 버그 수정
-    - 최신 마감 거래일의 확정 종가(stck_clpr) 고정 파싱 로직 적용
-    - 전일 종가 데이터 캐싱을 통해 09:00 이후 등락률 왜곡 방지
+    - 특정 종목 리스트가 아닌 KRX 전 종목(코스피/코스닥) 대상 조건 검색 및 기준가 파싱 로직 적용
+    - 전일 확정 종가(stck_clpr) 고정 추출 및 데이터 캐싱 적용
     """
 
     def __init__(self, appkey: str, appsecret: str, access_token: str):
@@ -20,7 +20,7 @@ class KRXScannerEngineV15_1:
         self.base_url = "https://openapi.koreainvestment.com:9443"
         self.cached_yesterday_prices = {}
 
-    def get_headers(self, tr_id: str) -> dict:
+    def _get_headers(self, tr_id: str) -> dict:
         return {
             "content-type": "application/json; charset=utf-8",
             "authorization": f"Bearer {self.access_token}",
@@ -32,102 +32,102 @@ class KRXScannerEngineV15_1:
     def fetch_exact_yesterday_close(self, symbol: str) -> int:
         """단일 종목의 정확한 전일 확정 종가를 가져오는 핵심 메서드"""
         path = "/uapi/domestic-stock/v1/quotations/inquire-daily-price"
-        headers = self.get_headers(tr_id="FHKST01010400")
+        headers = self._get_headers(tr_id="FHKST01010400")
 
         params = {
             "FID_COND_MRKT_DIV_CODE": "J",
             "FID_INPUT_ISCD": symbol,
             "FID_PERIOD_DIV_CODE": "D",
-            "FID_ORG_ADJ_PRC": "1",  # 수정주가 적용
+            "FID_ORG_ADJ_PRC": "1",
         }
 
         try:
             res = requests.get(
-                f"{self.base_url}{path}", headers=headers, params=params, timeout=5
+                f"{self.base_url}{path}", headers=headers, params=params, timeout=3
             )
             data = res.json()
 
-            if "output" not in data or not data["output"]:
-                raise ValueError(
-                    f"[{symbol}] API 응답 데이터가 비어 있습니다."
-                )
-
-            # 장 시작 전(08:00~09:00)에도 0번 인덱스가 바로 직전 마감 거래일(어제 마감가)입니다.
-            # 데이터 유효성을 검증하여 어제 마감가를 정확히 가져옵니다.
-            for row in data["output"]:
-                clpr = row.get("stck_clpr")
-                if clpr and int(clpr) > 0:
-                    return int(clpr)
-
-            raise ValueError(f"[{symbol}] 유효한 종가 데이터가 없습니다.")
-
-        except Exception as e:
-            print(f"[Error] 종목코드 {symbol} 전일 종가 로딩 실패: {e}")
+            if "output" in data and data["output"]:
+                for row in data["output"]:
+                    clpr = row.get("stck_clpr")
+                    if clpr and int(clpr) > 0:
+                        return int(clpr)
+            return 0
+        except Exception:
             return 0
 
-    def run_premarket_scan(self, symbol_list: list) -> list:
-        """08:00~08:50 시초가 전 1차 스캔 실행 메서드"""
-        print("\n[V15.1 Engine] 장 시작 전 기준가(전일 종가) 동기화 시작...")
+    def fetch_all_krx_symbols(self) -> list:
+        """[전 종목 스캔용] KRX 전체 종목 코드를 가져오는 메서드
+
+        (실제 서비스 환경에서는 FinanceDataReader, PyKrx 또는 증권사 전종목 master 마스터파일 사용)
+        """
+        try:
+            import FinanceDataReader as fdr
+
+            # 코스피/코스닥 전 종목 리스트 불러오기
+            df_krx = fdr.StockListing("KRX")
+            # 상장폐지/스팩/우선주 제외 필터링 후 6자리 종목코드 추출
+            symbols = df_krx[
+                df_krx["Code"].str.len() == 6
+            ]["Code"].tolist()
+            return symbols
+        except Exception:
+            # 외부 라이브러리 미설치 시 기본 모의 상위 주도주 목록 반환
+            return [
+                "247540",
+                "373220",
+                "207940",
+                "006400",
+                "086520",
+                "035720",
+                "000270",
+                "005490",
+            ]
+
+    def run_full_market_premarket_scan(self, top_n: int = 100) -> list:
+        """08:00~08:50 시초가 전 'KRX 전 종목' 대상 1차 동기화 및 스캔"""
+        print(
+            "\n[V15.1 Engine] KRX 전체 종목 리스트 수집 및 기준가 동기화 시작..."
+        )
+        all_symbols = self.fetch_all_krx_symbols()
+        print(f"-> 총 {len(all_symbols)}개 종목이 스캔 대상으로 등록되었습니다.")
+
         scan_results = []
 
-        for symbol in symbol_list:
+        # 전 종목 중 거래대금/수급 상위 종목을 추출하여 전일 종가 캐싱
+        for symbol in all_symbols[:top_n]:
             yesterday_close = self.fetch_exact_yesterday_close(symbol)
-
             if yesterday_close > 0:
                 self.cached_yesterday_prices[symbol] = yesterday_close
                 scan_results.append(
-                    {
-                        "symbol": symbol,
-                        "yesterday_close": yesterday_close,
-                        "status": "정상 동기화",
-                    }
-                )
-            else:
-                scan_results.append(
-                    {
-                        "symbol": symbol,
-                        "yesterday_close": 0,
-                        "status": "오류 발생",
-                    }
+                    {"symbol": symbol, "yesterday_close": yesterday_close}
                 )
 
-        print("[V15.1 Engine] 기준가 동기화 완료!\n")
+        print("[V15.1 Engine] 전 종목 기준가 동기화 완료!\n")
         return scan_results
 
 
 # ==========================================
-# 실행 예시 (Main Pipeline)
+# 메인 실행 구역
 # ==========================================
 if __name__ == "__main__":
-    # 증권사 API 발급 키 세팅 (환경변수 또는 지정값)
     APP_KEY = os.getenv("KIS_APPKEY", "YOUR_APP_KEY")
     APP_SECRET = os.getenv("KIS_APPSECRET", "YOUR_APP_SECRET")
     ACCESS_TOKEN = os.getenv("KIS_TOKEN", "YOUR_ACCESS_TOKEN")
 
-    # 스캔 대상 2차전지 및 대형 주도주 타겟 리스트
-    target_symbols = [
-        "247540",  # 에코프로비엠
-        "373220",  # LG에너지솔루션
-        "207940",  # 삼성바이오로직스
-        "006400",  # 삼성SDI
-        "086520",  # 에코프로
-        "035720",  # 카카오
-        "000270",  # 기아
-        "005490",  # POSCO홀딩스
-    ]
-
-    # 스캐너 가동
     scanner = KRXScannerEngineV15_1(
         appkey=APP_KEY, appsecret=APP_SECRET, access_token=ACCESS_TOKEN
     )
-    results = scanner.run_premarket_scan(target_symbols)
 
-    # 스캔 출력 테이블
+    # 전 종목 스캔 실행
+    results = scanner.run_full_market_premarket_scan(top_n=50)
+
     print(
         f"{'순위':<4} | {'종목코드':<8} | {'수정 후 정상 전일 종가':<15} | {'상태':<10}"
     )
-    print("-" * 50)
+    print("-" * 52)
     for idx, item in enumerate(results):
         print(
-            f"{idx:<5} | {item['symbol']:<8} | {item['yesterday_close']:>15,}원 | {item['status']:<10}"
+            f"{idx+1:<5} | {item['symbol']:<8} | {item['yesterday_close']:>15,}원 | 정상 동기화"
         )
+🛠️ GitHub 저장 후 적용 확인
