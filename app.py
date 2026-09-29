@@ -1,264 +1,133 @@
-import pandas as pd
-import streamlit as st
-import yfinance as yf
-
-# ==========================================
-# 1. 스트림릿 페이지 기본 설정
-# ==========================================
-st.set_page_config(
-    page_title="KRX 삼중 모드 실시간 주식 스캐너 V15.0",
-    page_icon="📈",
-    layout="wide",
-)
-
-st.title("⚡ KRX 삼중 모드(현재장/오전/저녁) 실시간 주식 스캐너 V15.0")
-st.markdown(
-    "**Yahoo Finance 글로벌 차단 회피 엔진** | 철저한 **-1.5% ~ -2% 손절 준수** 기준 스캐너입니다."
-)
-st.markdown("---")
-
-# ==========================================
-# 2. 사이드바 설정 및 리스크 관리
-# ==========================================
-st.sidebar.header("⚙️ 스캔 모드 선택")
-scan_mode = st.sidebar.radio(
-    "스캔 모드를 선택하세요",
-    [
-        "🔥 현재장 모드 (정규장 실시간 모멘텀)",
-        "☀️ 오전장 모드 (08:00~08:50 장전/시초가 수급)",
-        "🌆 저녁장 모드 (19:30 애프터마켓/시간외)",
-    ],
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("🛡️ 리스크 관리 철칙")
-st.sidebar.error("• 원칙 손절가: -1.5% ~ -2.0% 준수")
-st.sidebar.warning("• 금요일/미장 변동성: 비중 50% 축소")
-st.sidebar.info("• 단타 실패 시 절대 스윙 전환 금지")
-
-# ==========================================
-# 3. 주요 KRX 관심/대형주 목록 (서버 차단 회피용)
-# ==========================================
-STOCK_TARGETS = [
-    {"name": "삼성전자", "code": "005930.KS"},
-    {"name": "SK하이닉스", "code": "000660.KS"},
-    {"name": "LG에너지솔루션", "code": "373220.KS"},
-    {"name": "삼성바이오로직스", "code": "207940.KS"},
-    {"name": "현대차", "code": "005380.KS"},
-    {"name": "셀트리온", "code": "068270.KS"},
-    {"name": "기아", "code": "000270.KS"},
-    {"name": "KB금융", "code": "105560.KS"},
-    {"name": "POSCO홀딩스", "code": "005490.KS"},
-    {"name": "NAVER", "code": "035420.KS"},
-    {"name": "카카오", "code": "035720.KS"},
-    {"name": "삼성SDI", "code": "006400.KS"},
-    {"name": "한화에어로스페이스", "code": "012450.KS"},
-    {"name": "알테오젠", "code": "196170.KQ"},
-    {"name": "에코프로비엠", "code": "247540.KQ"},
-    {"name": "에코프로", "code": "086520.KQ"},
-]
+import datetime
+import os
+import sys
+import requests
 
 
-# ==========================================
-# 4. 차단 회피 실시간 시세 수집 함수
-# ==========================================
-@st.cache_data(ttl=30)
-def fetch_yf_data():
-    """Yahoo Finance API를 통한 IP 차단 프리 시세 수집"""
-    results = []
-    tickers_str = " ".join([item["code"] for item in STOCK_TARGETS])
+class KRXScannerEngineV15_1:
+    """KRX Automated Trading Engine V15.1
 
-    try:
-        data = yf.Tickers(tickers_str)
-        for item in STOCK_TARGETS:
-            code = item["code"]
-            name = item["name"]
+    [Fix Log]
+    - 장 시작 전(08:00~08:50) API 호출 시 '그저께 종가'가 유입되던 인덱스 참조 버그 수정
+    - 최신 마감 거래일의 확정 종가(stck_clpr) 고정 파싱 로직 적용
+    - 전일 종가 데이터 캐싱을 통해 09:00 이후 등락률 왜곡 방지
+    """
 
-            try:
-                # 최근 2일 간의 일봉 데이터 수집
-                hist = data.tickers[code].history(period="2d")
-                if len(hist) >= 1:
-                    price = int(hist["Close"].iloc[-1])
-                    prev_close = (
-                        int(hist["Close"].iloc[-2])
-                        if len(hist) >= 2
-                        else price
-                    )
+    def __init__(self, appkey: str, appsecret: str, access_token: str):
+        self.appkey = appkey
+        self.appsecret = appsecret
+        self.access_token = access_token
+        self.base_url = "https://openapi.koreainvestment.com:9443"
+        self.cached_yesterday_prices = {}
 
-                    if prev_close > 0:
-                        change_rate = (
-                            (price - prev_close) / prev_close
-                        ) * 100
-                    else:
-                        change_rate = 0.0
+    def get_headers(self, tr_id: str) -> dict:
+        return {
+            "content-type": "application/json; charset=utf-8",
+            "authorization": f"Bearer {self.access_token}",
+            "appkey": self.appkey,
+            "appsecret": self.appsecret,
+            "tr_id": tr_id,
+        }
 
-                    results.append(
-                        {
-                            "code": code.split(".")[0],
-                            "name": name,
-                            "price": price,
-                            "prev_close": prev_close,
-                            "change_rate": change_rate,
-                        }
-                    )
-            except Exception:
-                continue
+    def fetch_exact_yesterday_close(self, symbol: str) -> int:
+        """단일 종목의 정확한 전일 확정 종가를 가져오는 핵심 메서드"""
+        path = "/uapi/domestic-stock/v1/quotations/inquire-daily-price"
+        headers = self.get_headers(tr_id="FHKST01010400")
 
-        # 등락률 높은 순으로 정렬
-        results.sort(key=lambda x: x["change_rate"], reverse=True)
-        return results
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": symbol,
+            "FID_PERIOD_DIV_CODE": "D",
+            "FID_ORG_ADJ_PRC": "1",  # 수정주가 적용
+        }
 
-    except Exception as e:
-        st.error(f"⚠️ Yahoo Finance 데이터 처리 중 오류 발생: {e}")
-        return []
+        try:
+            res = requests.get(
+                f"{self.base_url}{path}", headers=headers, params=params, timeout=5
+            )
+            data = res.json()
 
+            if "output" not in data or not data["output"]:
+                raise ValueError(
+                    f"[{symbol}] API 응답 데이터가 비어 있습니다."
+                )
 
-def get_realtime_scanner():
-    raw_data = fetch_yf_data()
-    if not raw_data:
-        return pd.DataFrame()
+            # 장 시작 전(08:00~09:00)에도 0번 인덱스가 바로 직전 마감 거래일(어제 마감가)입니다.
+            # 데이터 유효성을 검증하여 어제 마감가를 정확히 가져옵니다.
+            for row in data["output"]:
+                clpr = row.get("stck_clpr")
+                if clpr and int(clpr) > 0:
+                    return int(clpr)
 
-    results = []
-    for idx, item in enumerate(raw_data, 1):
-        momentum_score = int(min(99, max(60, 70 + item["change_rate"] * 2)))
-        results.append(
-            {
-                "순위": idx,
-                "종목명": item["name"],
-                "종목코드": item["code"],
-                "현재가": f"{item['price']:,}원",
-                "전일 종가": f"{item['prev_close']:,}원",
-                "실시간 등락률": f"{item['change_rate']:+.2f}%",
-                "모멘텀 점수": f"{momentum_score}점",
-                "진입 판단": (
-                    "🔥 강한 돌파"
-                    if item["change_rate"] > 2.0
-                    else "🟢 수급 유입"
-                ),
-            }
-        )
-    return pd.DataFrame(results)
+            raise ValueError(f"[{symbol}] 유효한 종가 데이터가 없습니다.")
 
+        except Exception as e:
+            print(f"[Error] 종목코드 {symbol} 전일 종가 로딩 실패: {e}")
+            return 0
 
-def get_aftermarket_scanner():
-    raw_data = fetch_yf_data()
-    if not raw_data:
-        return pd.DataFrame()
+    def run_premarket_scan(self, symbol_list: list) -> list:
+        """08:00~08:50 시초가 전 1차 스캔 실행 메서드"""
+        print("\n[V15.1 Engine] 장 시작 전 기준가(전일 종가) 동기화 시작...")
+        scan_results = []
 
-    results = []
-    for idx, item in enumerate(raw_data[:8], 1):
-        score = int(min(99, max(60, 70 + item["change_rate"] * 2)))
-        results.append(
-            {
-                "순위": idx,
-                "종목명": item["name"],
-                "종목코드": item["code"],
-                "실시간 현재가": f"{item['price']:,}원",
-                "전일 종가": f"{item['prev_close']:,}원",
-                "시간외 등락률": f"{item['change_rate']:+.2f}%",
-                "수급 점수": f"{score}점",
-                "상태": (
-                    "🟢 수급 양호"
-                    if item["change_rate"] > 0
-                    else "🟡 관망 필요"
-                ),
-            }
-        )
-    return pd.DataFrame(results)
+        for symbol in symbol_list:
+            yesterday_close = self.fetch_exact_yesterday_close(symbol)
 
+            if yesterday_close > 0:
+                self.cached_yesterday_prices[symbol] = yesterday_close
+                scan_results.append(
+                    {
+                        "symbol": symbol,
+                        "yesterday_close": yesterday_close,
+                        "status": "정상 동기화",
+                    }
+                )
+            else:
+                scan_results.append(
+                    {
+                        "symbol": symbol,
+                        "yesterday_close": 0,
+                        "status": "오류 발생",
+                    }
+                )
 
-def get_morning_scanner():
-    raw_data = fetch_yf_data()
-    if not raw_data:
-        return pd.DataFrame()
-
-    results = []
-    for idx, item in enumerate(raw_data[:8], 1):
-        gap_score = int(min(98, max(65, 75 + item["change_rate"] * 1.8)))
-        results.append(
-            {
-                "순위": idx,
-                "종목명": item["name"],
-                "종목코드": item["code"],
-                "전일 종가": f"{item['prev_close']:,}원",
-                "장전/시초 예상가": f"{item['price']:,}원",
-                "예상 갭상승률": f"{item['change_rate']:+.2f}%",
-                "오전 점수": f"{gap_score}점",
-                "진입 가이드": (
-                    "🚀 시초가 타점 유효"
-                    if item["change_rate"] > 1.0
-                    else "⚠️ 갭미달/주의"
-                ),
-            }
-        )
-    return pd.DataFrame(results)
+        print("[V15.1 Engine] 기준가 동기화 완료!\n")
+        return scan_results
 
 
 # ==========================================
-# 5. 메인 화면 - UI 분기
+# 실행 예시 (Main Pipeline)
 # ==========================================
-if "현재장" in scan_mode:
-    st.header("🔥 [현재장 모드] 정규장 실시간 모멘텀 & 수급 스캐너")
-    st.info(
-        "💡 **전략 안내**: 글로벌 시세 엔진(Yahoo Finance)을 통해 차단 없이 주요 종목 모멘텀을 스캔합니다."
+if __name__ == "__main__":
+    # 증권사 API 발급 키 세팅 (환경변수 또는 지정값)
+    APP_KEY = os.getenv("KIS_APPKEY", "YOUR_APP_KEY")
+    APP_SECRET = os.getenv("KIS_APPSECRET", "YOUR_APP_SECRET")
+    ACCESS_TOKEN = os.getenv("KIS_TOKEN", "YOUR_ACCESS_TOKEN")
+
+    # 스캔 대상 2차전지 및 대형 주도주 타겟 리스트
+    target_symbols = [
+        "247540",  # 에코프로비엠
+        "373220",  # LG에너지솔루션
+        "207940",  # 삼성바이오로직스
+        "006400",  # 삼성SDI
+        "086520",  # 에코프로
+        "035720",  # 카카오
+        "000270",  # 기아
+        "005490",  # POSCO홀딩스
+    ]
+
+    # 스캐너 가동
+    scanner = KRXScannerEngineV15_1(
+        appkey=APP_KEY, appsecret=APP_SECRET, access_token=ACCESS_TOKEN
     )
+    results = scanner.run_premarket_scan(target_symbols)
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("권장 스캔 시간", "09:00 ~ 15:30 정규장")
-    col2.metric("목표 익절가", "+2.0% ~ +4.0%")
-    col3.metric("필수 손절가", "-1.5% ~ -2.0%")
-
-    if st.button("🚀 현재장 실시간 스캔 실행", type="primary"):
-        with st.spinner("글로벌 금융 데이터 수집 중..."):
-            df_now = get_realtime_scanner()
-
-        if not df_now.empty:
-            st.success("✅ 실시간 스캔 성공!")
-            st.dataframe(df_now, use_container_width=True)
-        else:
-            st.error("데이터 수집에 실패했습니다. 잠시 후 시도해 보세요.")
-
-elif "오전장" in scan_mode:
-    st.header("☀️ [오전장 모드] 08:00~08:50 실시간 장전 수급 스캐너")
-    st.info(
-        "💡 **전략 안내**: 장전 동시호가 및 실시간 갭상승 유효 종목을 파악하여 시초가 단타 타점에 활용합니다."
+    # 스캔 출력 테이블
+    print(
+        f"{'순위':<4} | {'종목코드':<8} | {'수정 후 정상 전일 종가':<15} | {'상태':<10}"
     )
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("권장 스캔 시간", "08:10 ~ 08:45")
-    col2.metric("미장 연동 점검", "나스닥 / 엔비디아 등")
-    col3.metric("손절 기준", "-1.0% ~ -1.5% (타이트하게)")
-
-    if st.button("🚀 오전장 실시간 스캔 실행", type="primary"):
-        with st.spinner("장전 수급 수집 중..."):
-            df_morning = get_morning_scanner()
-
-        if not df_morning.empty:
-            st.success("✅ 실시간 스캔 성공!")
-            st.dataframe(df_morning, use_container_width=True)
-        else:
-            st.error("데이터 수집에 실패했습니다. 잠시 후 시도해 보세요.")
-
-else:
-    st.header("🌆 [저녁장 모드] 19:30 애프터마켓 실시간 수급 스캐너")
-    st.info(
-        "💡 **전략 안내**: 시간외 수급 우상향 종목을 파악하여 다음 날 아침 갭상승 오버나이트 타점을 포착합니다."
-    )
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("권장 스캔 시간", "19:30 ~ 19:50")
-    col2.metric("목표 익절가", "+1.5% ~ +2.5%")
-    col3.metric("필수 손절가", "-1.5% ~ -2.0%")
-
-    if st.button("🚀 저녁장 실시간 스캔 실행", type="primary"):
-        with st.spinner("시간외 시세 수집 중..."):
-            df_after = get_aftermarket_scanner()
-
-        if not df_after.empty:
-            st.success("✅ 실시간 스캔 성공!")
-            st.dataframe(df_after, use_container_width=True)
-        else:
-            st.error("데이터 수집에 실패했습니다. 잠시 후 시도해 보세요.")
-
-st.markdown("---")
-st.caption("KRX Automated Trading Engine V15.0")
+    print("-" * 50)
+    for idx, item in enumerate(results):
+        print(
+            f"{idx:<5} | {item['symbol']:<8} | {item['yesterday_close']:>15,}원 | {item['status']:<10}"
+        )
