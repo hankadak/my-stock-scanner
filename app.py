@@ -130,4 +130,3 @@ if __name__ == "__main__":
         print(
             f"{idx+1:<5} | {item['symbol']:<8} | {item['yesterday_close']:>15,}원 | 정상 동기화"
         )
-🛠️ GitHub 저장 후 적용 확인
