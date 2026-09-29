@@ -1,6 +1,5 @@
 from datetime import datetime
 import os
-import sys
 import requests
 import streamlit as st
 
@@ -13,7 +12,7 @@ class KBSecuritiesScannerEngine:
         self.appkey = raw_key.strip()
         self.appsecret = raw_secret.strip()
 
-        # KB증권 OpenAPI Base URL
+        # KB증권 공식 OpenAPI 기본 URL
         self.base_url = "https://openapi.kbsec.com"
         self.access_token = ""
         self.last_error = ""
@@ -25,8 +24,9 @@ class KBSecuritiesScannerEngine:
             )
             return False
 
-        path = "/oauth2/tokenP"
-        headers = {"content-type": "application/x-www-form-urlencoded"}
+        # KB증권 공식 규격: POST /oauth2/token, Content-Type: application/json
+        path = "/oauth2/token"
+        headers = {"Content-Type": "application/json; charset=UTF-8"}
         body = {
             "grant_type": "client_credentials",
             "appkey": self.appkey,
@@ -35,13 +35,15 @@ class KBSecuritiesScannerEngine:
 
         try:
             res = requests.post(
-                f"{self.base_url}{path}", headers=headers, data=body, timeout=10
+                f"{self.base_url}{path}", headers=headers, json=body, timeout=10
             )
 
             try:
                 data = res.json()
             except Exception:
-                self.last_error = f"KB 응답 형식 오류 (상태코드: {res.status_code})"
+                # 서버에서 반환된 원문 일부 출력 (원인 파악용)
+                snippet = res.text[:100].replace("\n", " ")
+                self.last_error = f"응답 형식 오류(상태코드:{res.status_code}): {snippet}"
                 return False
 
             if res.status_code == 200 and "access_token" in data:
@@ -65,7 +67,7 @@ class KBSecuritiesScannerEngine:
 
         path_price = "/uapi/domestic-stock/v1/quotations/inquire-price"
         headers = {
-            "content-type": "application/json; charset=utf-8",
+            "Content-Type": "application/json; charset=UTF-8",
             "authorization": f"Bearer {self.access_token}",
             "appkey": self.appkey,
             "appsecret": self.appsecret,
@@ -84,7 +86,8 @@ class KBSecuritiesScannerEngine:
                 timeout=10,
             )
             if res.status_code == 200:
-                out = res.json().get("output", {})
+                data = res.json()
+                out = data.get("output", {})
                 return {
                     "success": True,
                     "name": out.get("hts_kor_isnm", ""),
@@ -100,7 +103,6 @@ class KBSecuritiesScannerEngine:
         return {"success": False, "reason": "시세 데이터 파싱 오류"}
 
     def scan_by_strategy(self, strategy_type: str) -> list:
-        # 주요 관심 종목 유니버스
         universe = [
             ("005930", "삼성전자"),
             ("000660", "SK하이닉스"),
@@ -125,12 +127,10 @@ class KBSecuritiesScannerEngine:
                 volume = kb_data["volume"]
                 name = kb_data["name"] or default_name
 
-                # 전략별 맞춤 필터링 및 포착 신호 생성
                 signal = ""
                 score = "HOLD"
 
                 if strategy_type == "morning":
-                    # 1. 장시작 전 / 장초반 탐색 (갭상승 + 시가 형성 관심주)
                     if rate >= 1.5 and power >= 120.0:
                         signal = "🔥 장초반 동시호가 강세 / 갭상승 포착"
                         score = "BUY"
@@ -140,7 +140,6 @@ class KBSecuritiesScannerEngine:
                         signal = "🔵 장전 약세 시가 예상"
 
                 elif strategy_type == "intraday":
-                    # 2. 장중 탐색 (돌파 및 수급 우수주: 체결강도 130% 이상, 갭상승)
                     if power >= 130.0 and rate >= 2.0:
                         signal = "🚀 장중 주도주 (체결강도 급증 + 상승 돌파)"
                         score = "STRONG BUY"
@@ -150,7 +149,6 @@ class KBSecuritiesScannerEngine:
                         signal = "⚪ 수급 소진 / 관망"
 
                 elif strategy_type == "overnight":
-                    # 3. 장마감 전 매수 ➔ 익일 매도 (종가 베팅: 상승 안정적 유지 + 체결강도 110% 이상)
                     if 1.0 <= rate <= 5.0 and power >= 110.0:
                         signal = "🎯 종가 베팅 조건 적합 (익일 갭상승 기대)"
                         score = "BUY (종가매수)"
@@ -204,7 +202,6 @@ def main():
             "⚠️ Streamlit Secrets에 KB_APPKEY와 KB_APPSECRET을 올바르게 등록해 주세요."
         )
 
-    # 3가지 시점별 탭 구성
     tab1, tab2, tab3 = st.tabs(
         [
             "🌅 1. 오전장 시작 전 탐색 (08:30~09:00)",
@@ -215,9 +212,7 @@ def main():
 
     with tab1:
         st.subheader("🌅 장 시작 전 / 장초반 갭상승 예상 종목 스캔")
-        st.caption(
-            "시가 갭상승 가능성이 높고 동시호가 수급이 들어오는 종목을 검색합니다."
-        )
+        st.caption("시가 갭상승 가능성이 높은 종목을 검색합니다.")
         if st.button("🚀 장전 스캔 실행", key="btn_m"):
             with st.spinner("장전 시세 분석 중..."):
                 data = scanner.scan_by_strategy("morning")
@@ -228,9 +223,7 @@ def main():
 
     with tab2:
         st.subheader("☀️ 장중 돌파 및 수급 급증 주도주 스캔")
-        st.caption(
-            "체결강도 130% 이상, 장중 상승 모멘텀이 강한 주도주를 탐색합니다."
-        )
+        st.caption("체결강도 130% 이상 장중 주도주를 탐색합니다.")
         if st.button("🚀 장중 주도주 스캔 실행", key="btn_i"):
             with st.spinner("장중 수급 스캔 중..."):
                 data = scanner.scan_by_strategy("intraday")
@@ -241,9 +234,7 @@ def main():
 
     with tab3:
         st.subheader("🌙 종가 베팅 (장마감 전 매수 ➔ 다음 날 시가/장초반 매도)")
-        st.caption(
-            "장 마감 직전(15:00~15:20) 종가를 유지하며 체결강도가 살아있는 오버나이트 적합 종목을 탐색합니다."
-        )
+        st.caption("장 마감 직전 종가 베팅 적합 종목을 탐색합니다.")
         if st.button("🚀 종가 베팅 종목 스캔 실행", key="btn_o"):
             with st.spinner("종가 베팅 후보군 분석 중..."):
                 data = scanner.scan_by_strategy("overnight")
