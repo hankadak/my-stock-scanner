@@ -1,5 +1,8 @@
 from datetime import datetime
 import os
+import time
+import FinanceDataReader as fdr
+import pandas as pd
 import pytz
 import requests
 import streamlit as st
@@ -24,7 +27,6 @@ class KBSecuritiesScannerEngine:
             )
             return False
 
-        # KB증권 토큰 발급
         path = "/oauth2/token"
         headers = {"content-type": "application/json; charset=UTF-8"}
         body = {
@@ -37,16 +39,7 @@ class KBSecuritiesScannerEngine:
             res = requests.post(
                 f"{self.base_url}{path}", headers=headers, json=body, timeout=10
             )
-
-            try:
-                data = res.json()
-            except Exception:
-                # JSON 변환 실패 시 HTML 내용 80자 출력
-                preview = res.text[:80].replace("\n", " ").replace("\r", "")
-                self.last_error = (
-                    f"토큰응답오류({res.status_code}): {preview}"
-                )
-                return False
+            data = res.json()
 
             if res.status_code == 200 and "access_token" in data:
                 self.access_token = data.get("access_token", "")
@@ -67,7 +60,6 @@ class KBSecuritiesScannerEngine:
             if not self.get_access_token():
                 return {"success": False, "reason": self.last_error}
 
-        # 시세 조회 경로
         path_price = "/uapi/domestic-stock/v1/quotations/inquire-price"
         headers = {
             "content-type": "application/json; charset=utf-8",
@@ -86,112 +78,118 @@ class KBSecuritiesScannerEngine:
                 f"{self.base_url}{path_price}",
                 headers=headers,
                 params=params_price,
-                timeout=10,
+                timeout=5,
             )
-
-            try:
-                data = res.json()
-            except Exception:
-                preview = res.text[:80].replace("\n", " ").replace("\r", "")
-                return {
-                    "success": False,
-                    "reason": f"시세응답HTML({res.status_code}): {preview}",
-                }
+            data = res.json()
 
             if res.status_code == 200:
-                # KB/한국투자 공통 API 포맷 지원
                 out = data.get("output", {}) or data.get("output1", {})
                 if not out and "stck_prpr" in data:
                     out = data
 
                 if out:
-                    price = int(out.get("stck_prpr", 0))
-                    rate = float(out.get("prdy_vrss_rt", 0.0))
-                    power = float(out.get("hts_avls", 0.0))
-                    volume = int(out.get("acml_vol", 0))
-                    name = out.get("hts_kor_isnm", "")
-
                     return {
                         "success": True,
-                        "name": name,
-                        "price": price,
-                        "power": power,
-                        "rate": rate,
-                        "volume": volume,
+                        "name": out.get("hts_kor_isnm", ""),
+                        "price": int(out.get("stck_prpr", 0)),
+                        "power": float(out.get("hts_avls", 0.0)),
+                        "rate": float(out.get("prdy_vrss_rt", 0.0)),
+                        "volume": int(out.get("acml_vol", 0)),
                     }
-                else:
-                    msg = data.get("msg1", data.get("message", "데이터 없음"))
-                    return {
-                        "success": False,
-                        "reason": f"시세데이터없음: {msg}",
-                    }
-            else:
-                msg = data.get("msg1", "응답 오류")
-                return {
-                    "success": False,
-                    "reason": f"시세조회실패({res.status_code}): {msg}",
-                }
+            return {
+                "success": False,
+                "reason": data.get("msg1", "데이터 조회 실패"),
+            }
         except Exception as e:
-            return {"success": False, "reason": f"통신예외: {str(e)}"}
+            return {"success": False, "reason": str(e)}
 
-    def scan_by_strategy(self, strategy_type: str) -> list:
-        universe = [
-            ("005930", "삼성전자"),
-            ("000660", "SK하이닉스"),
-            ("373220", "LG에너지솔루션"),
-            ("207940", "삼성바이오로직스"),
-            ("005935", "삼성전자우"),
-            ("000270", "기아"),
-            ("005490", "POSCO홀딩스"),
-            ("035720", "카카오"),
-            ("247540", "에코프로비엠"),
-            ("086520", "에코프로"),
+
+@st.cache_data(ttl=3600 * 12)
+def load_all_stocks(market_type="ALL"):
+    """코스피/코스닥 전체 종목 목록 로드"""
+    try:
+        df_krx = fdr.StockListing("KRX")
+        # 스팩, 리츠 등 제외하고 일반 주식만 추출
+        df_filtered = df_krx[~df_krx["Name"].str.contains("스팩|리츠|ETN|ETF")]
+
+        if market_type == "KOSPI":
+            df_filtered = df_filtered[df_filtered["Market"] == "KOSPI"]
+        elif market_type == "KOSDAQ":
+            df_filtered = df_filtered[df_filtered["Market"] == "KOSDAQ"]
+
+        return df_filtered[["Code", "Name", "Market"]].to_dict("records")
+    except Exception:
+        # Fallback (기본 상위 종목)
+        return [
+            {"Code": "005930", "Name": "삼성전자", "Market": "KOSPI"},
+            {"Code": "000660", "Name": "SK하이닉스", "Market": "KOSPI"},
+            {"Code": "373220", "Name": "LG에너지솔루션", "Market": "KOSPI"},
+            {"Code": "086520", "Name": "에코프로", "Market": "KOSDAQ"},
         ]
 
-        results = []
-        for count, (code, default_name) in enumerate(universe, 1):
-            kb_data = self.fetch_realtime_price(code)
 
-            if kb_data.get("success"):
-                price = kb_data["price"]
-                rate = kb_data["rate"]
-                power = kb_data["power"]
-                volume = kb_data["volume"]
-                name = kb_data["name"] or default_name
+def get_kst_now():
+    return datetime.now(pytz.timezone("Asia/Seoul")).strftime("%H:%M:%S")
 
-                signal = ""
-                score = "HOLD"
 
-                if strategy_type == "morning":
-                    if rate >= 1.5 and power >= 120.0:
-                        signal = "🔥 장초반 동시호가 강세 / 갭상승 포착"
-                        score = "BUY"
-                    elif rate > 0:
-                        signal = "🟡 시가 보합권 유지 중"
-                    else:
-                        signal = "🔵 장전 약세 시가 예상"
+def run_scanner(scanner, strategy_type, market_choice, max_scan_count):
+    stock_list = load_all_stocks(market_choice)
 
-                elif strategy_type == "intraday":
-                    if power >= 130.0 and rate >= 2.0:
-                        signal = "🚀 장중 주도주 (체결강도 급증 + 상승 돌파)"
-                        score = "STRONG BUY"
-                    elif power >= 100.0:
-                        signal = "🟢 수급 유입 양호 (추세 지속)"
-                    else:
-                        signal = "⚪ 수급 소진 / 관망"
+    if max_scan_count > 0:
+        stock_list = stock_list[:max_scan_count]
 
-                elif strategy_type == "overnight":
-                    if 1.0 <= rate <= 5.0 and power >= 110.0:
-                        signal = "🎯 종가 베팅 조건 적합 (익일 갭상승 기대)"
-                        score = "BUY (종가매수)"
-                    elif rate > 5.0:
-                        signal = "⚠️ 과열 구간 (상한가/급등 주의)"
-                    else:
-                        signal = "❌ 종가 매수 부적합"
+    results = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
 
+    total_len = len(stock_list)
+
+    for i, stock in enumerate(stock_list):
+        code = stock["Code"]
+        default_name = stock["Name"]
+        market = stock["Market"]
+
+        status_text.text(
+            f"🔍 [{i+1}/{total_len}] 종목 스캔 중... {default_name}({code})"
+        )
+        progress_bar.progress((i + 1) / total_len)
+
+        kb_data = scanner.fetch_realtime_price(code)
+
+        if kb_data.get("success"):
+            price = kb_data["price"]
+            rate = kb_data["rate"]
+            power = kb_data["power"]
+            volume = kb_data["volume"]
+            name = kb_data["name"] or default_name
+
+            signal = ""
+            score = "HOLD"
+
+            # 전략별 필터링 조건
+            if strategy_type == "morning":
+                if rate >= 1.5 and power >= 120.0:
+                    signal = "🔥 장초반 동시호가 강세 / 갭상승 포착"
+                    score = "BUY"
+                elif rate > 0:
+                    signal = "🟡 시가 보합권 유지 중"
+
+            elif strategy_type == "intraday":
+                if power >= 130.0 and rate >= 2.0:
+                    signal = "🚀 장중 주도주 (체결강도 급증 + 상승 돌파)"
+                    score = "STRONG BUY"
+                elif power >= 100.0:
+                    signal = "🟢 수급 유입 양호 (추세 지속)"
+
+            elif strategy_type == "overnight":
+                if 1.0 <= rate <= 5.0 and power >= 110.0:
+                    signal = "🎯 종가 베팅 조건 적합 (익일 갭상승 기대)"
+                    score = "BUY (종가매수)"
+
+            if signal:  # 조건에 부합하는 종목만 리스트에 추가
                 results.append(
                     {
-                        "순위": count,
+                        "시장": market,
                         "종목명": name,
                         "종목코드": code,
                         "현재가": f"{price:,}원",
@@ -202,34 +200,20 @@ class KBSecuritiesScannerEngine:
                         "매매 판단": score,
                     }
                 )
-            else:
-                reason = kb_data.get("reason", "연동 실패")
-                results.append(
-                    {
-                        "순위": count,
-                        "종목명": default_name,
-                        "종목코드": code,
-                        "현재가": "연동 실패",
-                        "등락률": "-",
-                        "체결강도": f"{reason}",
-                        "거래량": "-",
-                        "전략 포착 신호": "🔴 데이터 수신 불가",
-                        "매매 판단": "ERROR",
-                    }
-                )
 
-        return results
+        # KB증권 API 초당 제한 준수 (0.05초 대기)
+        time.sleep(0.05)
 
-
-def get_kst_now():
-    return datetime.now(pytz.timezone("Asia/Seoul")).strftime("%H:%M:%S")
+    progress_bar.empty()
+    status_text.empty()
+    return results
 
 
 def main():
     st.set_page_config(
-        page_title="KB증권 시점별 맞춤 스캐너", layout="wide"
+        page_title="KB증권 코스피/코스닥 전종목 스캐너", layout="wide"
     )
-    st.title("📈 KB증권 OpenAPI 시점별 트레이딩 스캐너")
+    st.title("📈 KB증권 코스피 & 코스닥 전체종목 맞춤 스캐너")
 
     scanner = KBSecuritiesScannerEngine()
 
@@ -237,6 +221,28 @@ def main():
         st.error(
             "⚠️ Streamlit Secrets에 KB_APPKEY와 KB_APPSECRET을 올바르게 등록해 주세요."
         )
+
+    # 사이드바 설정
+    st.sidebar.header("⚙️ 스캔 범위 설정")
+    market_choice = st.sidebar.radio(
+        "대상 시장 선택",
+        ["ALL (코스피+코스닥)", "KOSPI", "KOSDAQ"],
+        index=0,
+    )
+
+    if market_choice == "ALL (코스피+코스닥)":
+        m_code = "ALL"
+    else:
+        m_code = market_choice
+
+    max_scan_count = st.sidebar.slider(
+        "최대 스캔 종목 수 (테스트용)",
+        min_value=50,
+        max_value=2500,
+        value=300,
+        step=50,
+        help="전종목 스캔 시 시간이 소요되므로 슬라이더로 조절할 수 있습니다.",
+    )
 
     tab1, tab2, tab3 = st.tabs(
         [
@@ -248,30 +254,44 @@ def main():
 
     with tab1:
         st.subheader("🌅 장 시작 전 / 장초반 갭상승 예상 종목 스캔")
-        st.caption("시가 갭상승 가능성이 높은 종목을 검색합니다.")
-        if st.button("🚀 장전 스캔 실행", key="btn_m"):
-            with st.spinner("장전 시세 분석 중..."):
-                data = scanner.scan_by_strategy("morning")
-            st.success(f"✅ 동기화 완료 ({get_kst_now()})")
-            st.dataframe(data, use_container_width=True)
+        if st.button("🚀 전체 시장 장전 스캔 실행", key="btn_m"):
+            with st.spinner("코스피/코스닥 장전 시세 분석 중..."):
+                data = run_scanner(scanner, "morning", m_code, max_scan_count)
+            st.success(
+                f"✅ 동기화 완료 ({get_kst_now()}) - 총 {len(data)}개 종목 포착"
+            )
+            if data:
+                st.dataframe(data, use_container_width=True)
+            else:
+                st.info("조건에 맞는 종목이 없습니다.")
 
     with tab2:
         st.subheader("☀️ 장중 돌파 및 수급 급증 주도주 스캔")
-        st.caption("체결강도 130% 이상 장중 주도주를 탐색합니다.")
-        if st.button("🚀 장중 주도주 스캔 실행", key="btn_i"):
-            with st.spinner("장중 수급 스캔 중..."):
-                data = scanner.scan_by_strategy("intraday")
-            st.success(f"✅ 동기화 완료 ({get_kst_now()})")
-            st.dataframe(data, use_container_width=True)
+        if st.button("🚀 전체 시장 장중 주도주 스캔 실행", key="btn_i"):
+            with st.spinner("코스피/코스닥 장중 수급 스캔 중..."):
+                data = run_scanner(scanner, "intraday", m_code, max_scan_count)
+            st.success(
+                f"✅ 동기화 완료 ({get_kst_now()}) - 총 {len(data)}개 종목 포착"
+            )
+            if data:
+                st.dataframe(data, use_container_width=True)
+            else:
+                st.info("조건에 맞는 종목이 없습니다.")
 
     with tab3:
         st.subheader("🌙 종가 베팅 (장마감 전 매수 ➔ 다음 날 시가/장초반 매도)")
-        st.caption("장 마감 직전 종가 베팅 적합 종목을 탐색합니다.")
-        if st.button("🚀 종가 베팅 종목 스캔 실행", key="btn_o"):
-            with st.spinner("종가 베팅 후보군 분석 중..."):
-                data = scanner.scan_by_strategy("overnight")
-            st.success(f"✅ 동기화 완료 ({get_kst_now()})")
-            st.dataframe(data, use_container_width=True)
+        if st.button("🚀 전체 시장 종가 베팅 스캔 실행", key="btn_o"):
+            with st.spinner("코스피/코스닥 종가 베팅 후보군 분석 중..."):
+                data = run_scanner(
+                    scanner, "overnight", m_code, max_scan_count
+                )
+            st.success(
+                f"✅ 동기화 완료 ({get_kst_now()}) - 총 {len(data)}개 종목 포착"
+            )
+            if data:
+                st.dataframe(data, use_container_width=True)
+            else:
+                st.info("조건에 맞는 종목이 없습니다.")
 
 
 if __name__ == "__main__":
