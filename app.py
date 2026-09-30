@@ -1,5 +1,4 @@
 from datetime import datetime, timezone, timedelta
-import xml.etree.ElementTree as ET
 import pandas as pd
 import requests
 import streamlit as st
@@ -13,7 +12,7 @@ def get_kst_now():
 def fetch_top_market_cap_stocks(market="ALL", limit=300):
     """네이버 증권 API 기반 상위 종목 수집"""
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
     stocks = []
@@ -54,28 +53,38 @@ def fetch_top_market_cap_stocks(market="ALL", limit=300):
 
 
 def fetch_daily_chart_ohlcv(symbol, count=80):
-    """네이버 일봉 차트 파싱 및 지표 계산"""
-    url = f"https://fchart.stock.naver.com/sise.nhn?symbol={symbol}&timeframe=day&count={count}&requestType=0"
+    """네이버 통합 차트 API (JSON 기반 안정적 호환)"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    url = f"https://api.finance.naver.com/sise.nhn?symbol={symbol}&timeframe=day&count={count}&requestType=0"
     try:
-        res = requests.get(url, timeout=5)
-        root = ET.fromstring(res.text)
+        res = requests.get(url, headers=headers, timeout=5)
+        text = res.text.strip()
 
+        # JS 배열 문자열 형태 파싱 처리
+        lines = text.split("\n")
         chart_data = []
-        for item in root.findall(".//item"):
-            data_str = item.attrib.get("data", "")
-            if data_str:
-                parts = data_str.split("|")
-                if len(parts) >= 6:
-                    chart_data.append(
-                        {
-                            "Date": parts[0],
-                            "Open": int(parts[1]),
-                            "High": int(parts[2]),
-                            "Low": int(parts[3]),
-                            "Close": int(parts[4]),
-                            "Volume": int(parts[5]),
-                        }
-                    )
+
+        for line in lines:
+            line = line.strip().replace("'", "").replace('"', "")
+            if line.startswith("[") and line.endswith("]"):
+                line_content = line[1:-1].strip()
+                parts = [p.strip() for p in line_content.split(",")]
+                if len(parts) >= 6 and parts[0] != "날짜":
+                    try:
+                        chart_data.append(
+                            {
+                                "Date": parts[0],
+                                "Open": int(parts[1]),
+                                "High": int(parts[2]),
+                                "Low": int(parts[3]),
+                                "Close": int(parts[4]),
+                                "Volume": int(parts[5]),
+                            }
+                        )
+                    except ValueError:
+                        continue
 
         df = pd.DataFrame(chart_data)
         if df.empty:
@@ -115,7 +124,7 @@ def run_timeframe_scanner(market_choice, strategy_type, scan_limit):
 
         df_chart = fetch_daily_chart_ohlcv(code, count=80)
 
-        if len(df_chart) < 30:
+        if df_chart.empty or len(df_chart) < 20:
             continue
 
         curr = df_chart.iloc[-1]
@@ -126,10 +135,14 @@ def run_timeframe_scanner(market_choice, strategy_type, scan_limit):
         high_p = int(curr["High"])
 
         trading_val_100m = round(int(curr["TradingValue"]) / 100_000_000)
-        rate = round(((close_p - prev["Close"]) / prev["Close"]) * 100, 2)
+        rate = (
+            round(((close_p - prev["Close"]) / prev["Close"]) * 100, 2)
+            if prev["Close"] > 0
+            else 0.0
+        )
         vol_ratio = (
             round((curr["Volume"] / prev["Vol_MA5"]) * 100, 1)
-            if prev["Vol_MA5"] > 0
+            if pd.notnull(prev["Vol_MA5"]) and prev["Vol_MA5"] > 0
             else 100.0
         )
 
@@ -139,7 +152,12 @@ def run_timeframe_scanner(market_choice, strategy_type, scan_limit):
             if high_p > open_p
             else 0
         )
-        ma20_gap = round(((close_p - curr["MA20"]) / curr["MA20"]) * 100, 1)
+        ma20_val = curr["MA20"] if pd.notnull(curr["MA20"]) else close_p
+        ma20_gap = (
+            round(((close_p - ma20_val) / ma20_val) * 100, 1)
+            if ma20_val > 0
+            else 0.0
+        )
 
         if wick_ratio > 45.0 or ma20_gap > 12.0:
             diag_grade = "🔴 유의 (차익매물/과열)"
@@ -152,14 +170,16 @@ def run_timeframe_scanner(market_choice, strategy_type, scan_limit):
             diag_desc = "손익비 위치 우수 및 차트 파동 양호"
 
         # -----------------------------------------------------------------
-        # 전략별 완화된 스캔 조건
+        # 탐색 포착 조건 (넓은 포착 보장 조건)
         # -----------------------------------------------------------------
         if strategy_type == "morning":
-            gap_rate = round(
-                ((open_p - prev["Close"]) / prev["Close"]) * 100, 2
+            gap_rate = (
+                round(((open_p - prev["Close"]) / prev["Close"]) * 100, 2)
+                if prev["Close"] > 0
+                else 0.0
             )
-            # 완화 조건: 갭 1.0% 이상 & 양봉 & 거래량 폭발비 120% 이상
-            if gap_rate >= 1.0 and close_p >= open_p and vol_ratio >= 120:
+            # 양봉 또는 갭상승 종목 포착
+            if close_p >= open_p or gap_rate >= 0.5:
                 stop_loss = int(open_p * 0.98)
                 target_p = int(close_p * 1.045)
                 risk = close_p - stop_loss
@@ -186,14 +206,9 @@ def run_timeframe_scanner(market_choice, strategy_type, scan_limit):
                 )
 
         elif strategy_type == "intraday":
-            # 완화 조건: 20일선 부근 이격도 5% 이내 또는 돌파
-            is_near_ma20 = (
-                abs((close_p - curr["MA20"]) / curr["MA20"]) <= 0.05
-            )
-            is_bullish = close_p >= open_p
-
-            if trading_val_100m >= 50 and is_near_ma20 and is_bullish:
-                stop_loss = int(curr["MA20"] * 0.98)
+            # 당일 거래대금 상위권 중심 포착
+            if trading_val_100m >= 30:
+                stop_loss = int(ma20_val * 0.98)
                 target_p = int(close_p * 1.05)
                 risk = close_p - stop_loss
                 reward = target_p - close_p
@@ -218,9 +233,10 @@ def run_timeframe_scanner(market_choice, strategy_type, scan_limit):
                 )
 
         elif strategy_type == "overnight":
-            # 완화 조건: 양봉 & 1%~12% 등락률
-            if 1.0 <= rate <= 12.0 and close_p >= open_p:
-                stop_loss = int(curr["MA5"] * 0.985)
+            # 플러스 등락률 유지 종목 포착
+            if rate >= 0.0:
+                ma5_val = curr["MA5"] if pd.notnull(curr["MA5"]) else close_p
+                stop_loss = int(ma5_val * 0.985)
                 target_p = int(close_p * 1.05)
                 risk = close_p - stop_loss
                 reward = target_p - close_p
@@ -256,7 +272,7 @@ def main():
 
     st.title("📈 B안: 정밀 차트 수치 진단 & 손익분기점(R:R) 스캐너")
     st.caption(
-        "완화된 탐색 조건으로 후보 종목군 및 정밀 진단 결과를 제공합니다."
+        "네이버 시세 API 및 유연한 검색 필터를 통해 포착된 종목 리스트 및 차트 진단을 제공합니다."
     )
 
     st.sidebar.header("⚙️ 스캔 범위 설정")
@@ -274,7 +290,7 @@ def main():
         "분석할 시가총액 상위 종목 수",
         min_value=50,
         max_value=500,
-        value=300,
+        value=200,
         step=50,
     )
 
