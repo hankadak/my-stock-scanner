@@ -6,7 +6,6 @@ import streamlit as st
 
 
 def get_kst_now():
-    """파이썬 내장 datetime만으로 KST(한국 표준시) 구하기 (pytz 의존성 제거)"""
     return datetime.now(timezone(timedelta(hours=9)))
 
 
@@ -134,9 +133,7 @@ def run_timeframe_scanner(market_choice, strategy_type, scan_limit):
             else 100.0
         )
 
-        # -----------------------------------------------------------------
-        # 차트 정밀 수치 진단 계산 (윗꼬리 & 20일선 이격도)
-        # -----------------------------------------------------------------
+        # 차트 진단 수치
         wick_ratio = (
             round(((high_p - close_p) / (high_p - open_p + 1e-5)) * 100, 1)
             if high_p > open_p
@@ -155,13 +152,14 @@ def run_timeframe_scanner(market_choice, strategy_type, scan_limit):
             diag_desc = "손익비 위치 우수 및 차트 파동 양호"
 
         # -----------------------------------------------------------------
-        # 전략별 스캔
+        # 전략별 완화된 스캔 조건
         # -----------------------------------------------------------------
         if strategy_type == "morning":
             gap_rate = round(
                 ((open_p - prev["Close"]) / prev["Close"]) * 100, 2
             )
-            if 1.5 <= gap_rate <= 6.5 and close_p >= open_p and vol_ratio >= 150:
+            # 완화 조건: 갭 1.0% 이상 & 양봉 & 거래량 폭발비 120% 이상
+            if gap_rate >= 1.0 and close_p >= open_p and vol_ratio >= 120:
                 stop_loss = int(open_p * 0.98)
                 target_p = int(close_p * 1.045)
                 risk = close_p - stop_loss
@@ -181,32 +179,22 @@ def run_timeframe_scanner(market_choice, strategy_type, scan_limit):
                         "윗꼬리 비율": f"{wick_ratio:.1f}%",
                         "20일선 이격도": f"{ma20_gap:+.1f}%",
                         "🎯 1차 목표가": f"{target_p:,}원",
-                        "🛡️️ 손절 기준가": f"{stop_loss:,}원",
+                        "🛡️ 손절 기준가": f"{stop_loss:,}원",
                         "손익비 (R:R)": f"1 : {rr_ratio}",
                         "진단 요약": diag_desc,
                     }
                 )
 
         elif strategy_type == "intraday":
-            is_breakout = (
-                close_p > open_p
-                and curr["Close"] > curr["MA20"]
-                and prev["Close"] <= prev["MA20"]
+            # 완화 조건: 20일선 부근 이격도 5% 이내 또는 돌파
+            is_near_ma20 = (
+                abs((close_p - curr["MA20"]) / curr["MA20"]) <= 0.05
             )
-            is_aligned_pullback = (
-                curr["MA5"] > curr["MA20"] > curr["MA60"]
-                and abs((close_p - curr["MA20"]) / curr["MA20"]) <= 0.02
-            )
+            is_bullish = close_p >= open_p
 
-            if trading_val_100m >= 100 and (
-                is_breakout or is_aligned_pullback
-            ):
-                stop_loss = (
-                    int(open_p * 0.97)
-                    if is_breakout
-                    else int(curr["MA20"] * 0.98)
-                )
-                target_p = int(close_p * 1.06)
+            if trading_val_100m >= 50 and is_near_ma20 and is_bullish:
+                stop_loss = int(curr["MA20"] * 0.98)
+                target_p = int(close_p * 1.05)
                 risk = close_p - stop_loss
                 reward = target_p - close_p
                 rr_ratio = round(reward / risk, 2) if risk > 0 else 0
@@ -230,11 +218,8 @@ def run_timeframe_scanner(market_choice, strategy_type, scan_limit):
                 )
 
         elif strategy_type == "overnight":
-            if (
-                2.0 <= rate <= 8.0
-                and close_p > open_p
-                and curr["Close"] > curr["MA5"]
-            ):
+            # 완화 조건: 양봉 & 1%~12% 등락률
+            if 1.0 <= rate <= 12.0 and close_p >= open_p:
                 stop_loss = int(curr["MA5"] * 0.985)
                 target_p = int(close_p * 1.05)
                 risk = close_p - stop_loss
@@ -271,7 +256,7 @@ def main():
 
     st.title("📈 B안: 정밀 차트 수치 진단 & 손익분기점(R:R) 스캐너")
     st.caption(
-        "외부 패키지 없이 파이썬 순수 라이브러리로 윗꼬리 비율, 20일선 이격도, 과열 진단 리포트를 제공합니다."
+        "완화된 탐색 조건으로 후보 종목군 및 정밀 진단 결과를 제공합니다."
     )
 
     st.sidebar.header("⚙️ 스캔 범위 설정")
@@ -289,7 +274,7 @@ def main():
         "분석할 시가총액 상위 종목 수",
         min_value=50,
         max_value=500,
-        value=200,
+        value=300,
         step=50,
     )
 
